@@ -4,9 +4,13 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 import uuid
+from collections import deque
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 
@@ -15,10 +19,95 @@ class OndoFatalError(RuntimeError):
 
 
 class OndoAPIError(RuntimeError):
-    def __init__(self, message, code="", uncertain=False):
+    def __init__(self, message, code="", uncertain=False, status=None, retry_after=None):
         super().__init__(message)
         self.code = code
         self.uncertain = uncertain
+        self.status = status
+        self.retry_after = retry_after
+
+
+class OndoRequestSkipped(RuntimeError):
+    """请求排队期间已失效，尚未发送。"""
+
+
+class RequestLimiter:
+    """同一账户共享：平滑发送、滑动窗口、优先级和 429 冷却。"""
+
+    def __init__(self, rps=5, clock=None, wait=None):
+        if isinstance(rps, bool) or int(rps) != rps or rps < 1:
+            raise ValueError("rps must be a positive integer")
+        self.rps = int(rps)
+        self.normal_rps = max(1, self.rps - 1)
+        self.clock = clock or time.monotonic
+        self.condition = threading.Condition()
+        self.wait = wait or self.condition.wait
+        self.sent = deque()
+        self.normal_sent = deque()
+        self.waiters = {}
+        self.sequence = 0
+        self.next_at = 0.0
+        self.cooldown_until = 0.0
+        self.cooldown_generation = 0
+        self.backoff = 0.0
+        self.last_429 = float("-inf")
+        self.stopped = False
+
+    def acquire(self, priority=2, valid=None):
+        with self.condition:
+            ticket = self.sequence
+            self.sequence += 1
+            self.waiters[ticket] = priority
+            try:
+                while True:
+                    if self.stopped or (valid is not None and not valid()):
+                        raise OndoRequestSkipped("Queued request is no longer valid")
+                    now = self.clock()
+                    for timestamps in (self.sent, self.normal_sent):
+                        while timestamps and now - timestamps[0] >= 1:
+                            timestamps.popleft()
+                    eligible = [(p, t) for t, p in self.waiters.items()
+                                if p < 2 or len(self.normal_sent) < self.normal_rps]
+                    first = min(eligible, default=None)
+                    ready_at = max(self.next_at, self.cooldown_until)
+                    if len(self.sent) >= self.rps:
+                        ready_at = max(ready_at, self.sent[0] + 1)
+                    if priority >= 2 and len(self.normal_sent) >= self.normal_rps:
+                        ready_at = max(ready_at, self.normal_sent[0] + 1)
+                    if first == (priority, ticket) and now >= ready_at:
+                        self.sent.append(now)
+                        if priority >= 2:
+                            self.normal_sent.append(now)
+                        self.next_at = now + 1 / self.rps
+                        return
+                    # 短等待保证状态失效和退出能及时打断排队。
+                    delay = max(0.001, min(0.1, ready_at - now))
+                    self.wait(delay)
+            finally:
+                self.waiters.pop(ticket, None)
+                self.condition.notify_all()
+
+    def defer(self, retry_after=None):
+        with self.condition:
+            now = self.clock()
+            if now >= self.cooldown_until:
+                self.backoff = 2 if now - self.last_429 >= 60 else min(30, max(2, self.backoff * 2))
+                self.cooldown_generation += 1
+            self.last_429 = now
+            delay = self.backoff if retry_after is None else max(0, retry_after)
+            self.cooldown_until = max(self.cooldown_until, now + delay)
+            self.next_at = max(self.next_at, self.cooldown_until)
+            self.condition.notify_all()
+            return max(0, self.cooldown_until - now)
+
+    @property
+    def cooling(self):
+        return self.clock() < self.cooldown_until
+
+    def stop(self):
+        with self.condition:
+            self.stopped = True
+            self.condition.notify_all()
 
 
 class OndoExchange:
@@ -26,7 +115,7 @@ class OndoExchange:
 
     def __init__(
         self, api_key_id, api_secret,
-        api_url="https://api.ondoperps.xyz", timeout=10,
+        api_url="https://api.ondoperps.xyz", timeout=10, limiter=None,
     ):
         try:
             import requests
@@ -59,22 +148,43 @@ class OndoExchange:
         self._markets = {}
         self._markets_by_id = {}
         self._closed = False
+        self.limiter = limiter or RequestLimiter()
+        self._request_local = threading.local()
 
     @classmethod
-    def from_env(cls):
+    def from_env(cls, limiter=None):
         api_key_id = os.getenv("ONDO_API_KEY_ID", "").strip().strip("'\"")
         api_secret = os.getenv("ONDO_API_SECRET", "").strip().strip("'\"")
         api_url = os.getenv(
             "ONDO_API_URL", "https://api.ondoperps.xyz"
         ).strip().strip("'\"")
         timeout = float(os.getenv("ONDO_TIMEOUT", "10").strip().strip("'\""))
-        return cls(api_key_id, api_secret, api_url, timeout)
+        return cls(api_key_id, api_secret, api_url, timeout, limiter=limiter)
+
+    @contextmanager
+    def request_context(self, priority=2, valid=None, post_valid=None):
+        if not hasattr(self, "_request_local"):
+            self._request_local = threading.local()
+        previous = getattr(self._request_local, "settings", (2, None, None))
+        self._request_local.settings = (priority, valid, post_valid)
+        try:
+            yield
+        finally:
+            self._request_local.settings = previous
 
     def _request(self, method, path, params=None, body=None, private=True):
         if self._closed:
             raise RuntimeError("Ondo client is closed")
 
         method = method.upper()
+        priority, valid, post_valid = getattr(self._request_local, "settings", (2, None, None))
+        if method == "GET" and "/orders/client:" in path:
+            priority = min(priority, 1)
+        def allowed():
+            return ((valid is None or valid())
+                    and (method != "POST" or post_valid is None or post_valid()))
+        # 等待额度后才构造和签名，避免时间戳在队列中失效。
+        self.limiter.acquire(priority, allowed)
         body_text = (
             json.dumps(body, separators=(",", ":")) if body is not None else ""
         )
@@ -112,12 +222,37 @@ class OndoExchange:
 
         with response:
             status = response.status_code
+            if status == 429:
+                retry_after = None
+                header = response.headers.get("Retry-After")
+                if header:
+                    try:
+                        seconds = float(header)
+                        retry_after = seconds if 0 <= seconds < float("inf") else None
+                    except ValueError:
+                        try:
+                            retry_after = max(0, parsedate_to_datetime(header).timestamp() - time.time())
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                delay = self.limiter.defer(retry_after)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                raise OndoAPIError(
+                    "Ondo HTTP 429: account rate limit; all REST requests paused",
+                    code="too_many_requests", status=429, retry_after=delay,
+                    uncertain=method in {"POST", "DELETE"} and (
+                        not isinstance(payload, dict) or payload.get("success") is not False
+                    ),
+                )
             try:
                 payload = response.json()
             except ValueError:
                 raise OndoAPIError(
                     f"Ondo returned invalid JSON (HTTP {status})",
                     uncertain=method in {"POST", "DELETE"},
+                    status=status,
                 ) from None
             if (
                 not 200 <= status < 300
@@ -132,7 +267,7 @@ class OndoExchange:
                 for secret in (self.api_key_id, self._api_secret):
                     detail = detail.replace(secret, "<redacted>")
                 raise OndoAPIError(
-                    detail, code=code,
+                    detail, code=code, status=status,
                     uncertain=method in {"POST", "DELETE"} and (
                         status >= 500 or 300 <= status < 400
                         or not isinstance(payload, dict)
@@ -296,16 +431,23 @@ class OndoExchange:
             "info": order,
         }
 
-    def fetch_open_orders(self, symbol):
-        market = self.market(symbol)
-        params = {"market": market["id"], "status": "open", "limit": 1000}
+    def fetch_open_orders(self, symbol=None):
+        if not self._markets:
+            self.load_markets()
+        market = self.market(symbol) if symbol else None
+        params = {"status": "open", "limit": 1000}
+        if market:
+            params["market"] = market["id"]
         orders, cursors = {}, set()
         while True:
             page = self._request("GET", "/v1/perps/orders", params=params)
-            if not isinstance(page["result"], list):
+            rows = page["result"]
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
                 raise ValueError("Invalid Ondo open orders response")
-            for raw in page["result"]:
-                if raw["market"] != market["id"]:
+            for raw in rows:
+                if market and raw["market"] != market["id"]:
                     raise ValueError("Ondo returned orders for another market")
                 if raw["status"] in {"open", "pending", "untriggered"}:
                     order = self._parse_order(raw)
@@ -369,8 +511,15 @@ class OndoExchange:
                     response = self._request(
                         "GET", f"/v1/perps/orders/client:{client_id}"
                     )
+            except OndoRequestSkipped:
+                if attempt == 0:
+                    raise
+                raise OndoAPIError("Order lookup interrupted after submission", uncertain=True) from None
             except OndoAPIError as exc:
                 if attempt == 0 and not exc.uncertain and exc.code != "clientOrderID_collision":
+                    raise
+                if exc.status == 429:
+                    exc.uncertain = True
                     raise
                 continue
             try:

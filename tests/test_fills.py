@@ -71,6 +71,7 @@ class MainOrderSyncTests(unittest.IsolatedAsyncioTestCase):
         self.state = self.bot.states[self.market["symbol"]]
         self.bot.risk_ok = self.bot.ws_ready = True
         self.bot.generation = self.state.synced_generation = 1
+        self.state.position_dirty = False
         self.bot.set_book(self.state, {"bids": [["80.64", "100"]],
                                        "asks": [["80.66", "100"]]})
         await self.bot.place_quote(self.state, "buy")
