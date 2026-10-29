@@ -271,8 +271,10 @@ class PostOnlyBot:
         ):
             order = await asyncio.to_thread(client.cancel_order, order["id"], state.symbol)
             self.observe_order(state, order["info"])
-        fills = await asyncio.to_thread(client.fetch_order_fills, order["id"], state.symbol)
-        self.accept_fills(state, fills)
+        # 只补查尚未收到的成交；零成交订单和已由 WS 补齐的订单不必查明细。
+        if entry["seen_size"] < entry["filled"]:
+            fills = await asyncio.to_thread(client.fetch_order_fills, order["id"], state.symbol)
+            self.accept_fills(state, fills)
         # 终态累计成交与逐笔成交对齐后，才能释放主单槽位。
         if entry["seen_size"] < entry["filled"]:
             raise OndoAPIError(f"成交明细尚未齐全: {entry['cid']}")

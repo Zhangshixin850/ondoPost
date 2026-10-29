@@ -426,8 +426,14 @@ class OndoExchange:
     def fetch_order_fills(self, order_id, symbol):
         market_id = self.market(symbol)["id"]
         fills = self._request("GET", f"/v1/perps/orders/{order_id}/fills")["result"]
+        # 空成交可能序列化为 null；累计成交校验仍由主程序负责。
+        if fills is None:
+            return []
         if not isinstance(fills, list):
-            raise ValueError("Invalid Ondo fills response")
+            detail = type(fills).__name__
+            if isinstance(fills, dict):
+                detail += f" keys={list(fills)[:8]}"
+            raise ValueError(f"Invalid Ondo fills response: expected list or null, got {detail}")
         for fill in fills:
             if (
                 fill["market"] != market_id

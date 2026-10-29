@@ -19,6 +19,7 @@ __pycache__/
 htmlcov/
 
 # Runtime and build artifacts
+error.txt
 *.log
 logs/
 *.pid
