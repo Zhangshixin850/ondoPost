@@ -1,0 +1,4 @@
+# Ubuntu Python 3.10+；使用独立虚拟环境。
+requests>=2.34.2,<3
+python-dotenv>=1.2.2
+websockets>=15.0.1,<16
