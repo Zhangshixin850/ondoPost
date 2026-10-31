@@ -1,8 +1,7 @@
-"""Ondo 奖励挂单：python postOnly.py；仅检查配置：python postOnly.py --check。"""
+"""Ondo v2.0：跟随最大外部价位；--check 只检查本地配置。"""
 
 import argparse
 import asyncio
-import hashlib
 import logging
 import os
 import signal
@@ -12,102 +11,103 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv
+from ondo_exchange import AccountLimiter, OndoAPIError, OndoExchange, OndoFatalError, OndoRequestSkipped
 
-from ondo_exchange import (
-    OndoAPIError, OndoExchange, OndoFatalError, OndoRequestSkipped, RequestLimiter,
-)
-
-
-BPS = Decimal("10000")
-TARGET = Decimal("4")
+BPS = Decimal('10000')
+BAND = Decimal('5')
 RISK_SECONDS = 10
 RECONCILE_SECONDS = 30
 BOOK_SECONDS = 3
-MAIN_PREFIX = "po_q_"
-HEDGE_PREFIX = "po_h_"
-TERMINAL = {"filled", "canceled"}
-log = logging.getLogger("postOnly")
+MAIN_PREFIX = 'po_q_'
+TERMINAL = {'filled', 'canceled'}
+log = logging.getLogger('postOnly')
+
+
+@dataclass
+class MarketConfig:
+    symbol: str
+    order_size: Decimal
+    position_limit: Decimal
 
 
 @dataclass
 class Config:
-    symbols: tuple
-    order_size: Decimal
-    position_limit: Decimal
-    verse: Decimal
-    mmr: Decimal
-    max_leverage: Decimal
-    near_limit: Decimal = Decimal("2")
-    far_limit: Decimal = Decimal("4.9")
-    rps: int = 5
+    markets: tuple
+    mmr: Decimal = Decimal('0.2')
+    max_leverage: Decimal = Decimal('5')
+
+    @property
+    def symbols(self):
+        return tuple(m.symbol for m in self.markets)
 
     @classmethod
     def from_env(cls):
-        load_dotenv(Path(__file__).with_name(".env"), encoding="utf-8-sig")
-        symbols = tuple(value for i in (1, 2, 3)
-                        if (value := os.getenv(f"symbol{i}", "").strip().upper()))
-        if not symbols or len(set(symbols)) != len(symbols):
-            raise ValueError("至少填写一个 symbol，非空市场不能重复")
-        numbers = []
-        for name, default in (
-            ("orderSize", ""), ("myLimit", ""),
-            ("verse", "2"), ("MMR", "0.2"), ("leverage", "5"),
-            ("nearLimit", "2"), ("farLimit", "4.9"),
-        ):
+        load_dotenv(Path(__file__).with_name('.env'), encoding='utf-8-sig')
+        values = {}
+        markets = []
+        for i in (1, 2, 3):
+            symbol = os.getenv(f'symbol{i}', '').strip().upper()
+            if not symbol:
+                continue
+            for name in (f'orderSize{i}', f'myLimit{i}'):
+                values[name] = os.getenv(name, '').strip()
+            markets.append((symbol, f'orderSize{i}', f'myLimit{i}'))
+        if not markets or len({m[0] for m in markets}) != len(markets):
+            raise ValueError('至少填写一个 symbol，非空市场不能重复')
+        values.update(MMR=os.getenv('MMR', '0.2').strip(), leverage=os.getenv('leverage', '5').strip())
+        for name, raw in values.items():
             try:
-                value = Decimal(os.getenv(name, default).strip())
+                number = Decimal(raw)
             except InvalidOperation:
-                raise ValueError(f"{name} 必须是有效数字") from None
-            if not value.is_finite() or value <= 0:
-                raise ValueError(f"{name} 必须是有限正数")
-            numbers.append(value)
-        if numbers[2] >= BPS:
-            raise ValueError("verse 必须小于 10000bps")
-        if not numbers[5] <= TARGET <= numbers[6] or numbers[5] >= numbers[6]:
-            raise ValueError("挂单区间必须满足 0 < nearLimit <= 4 <= farLimit，且 nearLimit < farLimit")
-        try:
-            rps = int(os.getenv("rps", "5").strip())
-        except ValueError:
-            raise ValueError("rps 必须是正整数") from None
-        if rps < 1:
-            raise ValueError("rps 必须是正整数")
-        return cls(symbols, *numbers, rps)
+                raise ValueError(f'{name} 必须是有效数字') from None
+            if not number.is_finite() or number <= 0:
+                raise ValueError(f'{name} 必须是有限正数')
+            values[name] = number
+        return cls(tuple(MarketConfig(s, values[o], values[l]) for s, o, l in markets),
+                   values['MMR'], values['leverage'])
 
 
 @dataclass
 class MarketState:
     market: dict
+    order_size: Decimal
+    position_limit: Decimal
     main: dict = field(default_factory=dict)
     tracked: dict = field(default_factory=dict)
     by_id: dict = field(default_factory=dict)
+    own_orders: dict = field(default_factory=dict)
+    orders_seq: int = 0
     fills: deque = field(default_factory=deque)
     updates: deque = field(default_factory=deque)
     seen: set = field(default_factory=set)
-    hedges: dict = field(default_factory=dict)
     partial: set = field(default_factory=set)
     retry_at: dict = field(default_factory=dict)
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     book: tuple = ()
     book_at: float = 0
-    position: Decimal = Decimal("0")
-    mark: Decimal = Decimal("0")
+    book_time: float = 0
+    depth: tuple = ()
+    depth_at: float = 0
+    depth_time: float = 0
+    depth_seq: int = 0
+    depth_barrier: int = -1
+    position: Decimal = Decimal('0')
+    mark: Decimal = Decimal('0')
     position_dirty: bool = True
     position_seq: int = 0
     position_refresh_at: float = 0
-    book_retry_at: float = 0
-    book_refreshing: bool = False
     synced_generation: int = -1
-    stopped: str = ""
-    fatal: str = ""
-    problem: str = ""
+    stopped: str = ''
+    fatal: str = ''
+    problem: str = ''
 
     @property
     def symbol(self):
-        return self.market["symbol"]
+        return self.market['symbol']
 
 
 class PostOnlyBot:
@@ -116,47 +116,35 @@ class PostOnlyBot:
         self.risk_client = risk_client
         self.clients = clients
         self.account_client = account_client or risk_client
-        limiter = getattr(risk_client, "limiter", None)
-        self.limiter = limiter if limiter and limiter.rps == config.rps else RequestLimiter(config.rps)
+        self.limiter = AccountLimiter()
         for client in {risk_client, self.account_client, *clients.values()}:
             client.limiter = self.limiter
-        self.states = {
-            symbol: MarketState(client.market(symbol))
-            for symbol, client in clients.items()
-        }
-        self.by_market = {s.market["id"]: s for s in self.states.values()}
-        self.risk_ok = False
-        self.tripped = ""
-        self.ws_ready = False
-        self.generation = 0
-        self.closing = False
+        settings = {risk_client.market(m.symbol)['symbol']: m for m in config.markets}
+        self.states = {s: MarketState(c.market(s), settings[s].order_size, settings[s].position_limit)
+                       for s, c in clients.items()}
+        self.by_market = {s.market['id']: s for s in self.states.values()}
+        self.risk_ok = self.ws_ready = self.closing = False
+        self.tripped = ''
+        self.generation = self.exit_code = 0
         self.shutdown_deadline = 0
         self.stop_event = asyncio.Event()
-        self.exit_code = 0
         self.account_wake = asyncio.Event()
-        self.need_reconcile = True
+        self.need_reconcile = self.risk_refresh = True
         self.recovering = False
-        self.last_cooldown = -1
         self.reconcile_lock = asyncio.Lock()
         self.last_risk = None
         self.risk_at = 0
-        self.risk_refresh = True
 
     def primary_paused(self, state):
-        return (
-            self.closing or bool(self.tripped) or not self.risk_ok
-            or self.recovering or self.limiter.cooling
-            or not self.ws_ready or state.synced_generation != self.generation
-            or bool(state.stopped or state.fatal or state.problem)
-            or any(h["attempts"] or h["unknown"] for h in state.hedges.values())
-        )
+        return (self.closing or bool(self.tripped) or not self.risk_ok or self.recovering
+                or self.limiter.cooling or not self.ws_ready
+                or state.synced_generation != self.generation
+                or bool(state.stopped or state.fatal or state.problem))
 
     def quote_allowed(self, state):
-        return (
-            not self.primary_paused(state) and not state.hedges
-            and not state.position_dirty
-            and not state.partial and not state.fills and not state.updates
-        )
+        return (not self.primary_paused(state) and not state.position_dirty
+                and not state.partial and not state.fills and not state.updates
+                and not any(e['id'] and e['status'] == 'pending' for e in state.tracked.values()))
 
     async def rest(self, client, method, *args, priority=2, valid=None, post_valid=None):
         def allowed():
@@ -168,18 +156,12 @@ class PostOnlyBot:
         try:
             return await asyncio.to_thread(execute)
         except OndoAPIError as exc:
-            if exc.status == 429 or exc.code == "too_many_requests":
-                if not self.limiter.cooling:
-                    self.limiter.defer(exc.retry_after)
+            if exc.status == 429 or exc.code == 'too_many_requests':
                 self.recovering = self.need_reconcile = self.risk_refresh = True
                 self.risk_ok = False
-                if self.last_cooldown != self.limiter.cooldown_generation:
-                    self.last_cooldown = self.limiter.cooldown_generation
-                    log.warning("账户限流，所有 REST 冷却 %.1f 秒",
-                                max(0, self.limiter.cooldown_until - time.monotonic()))
                 self.account_wake.set()
-                for state in self.states.values():
-                    state.wake.set()
+                for current in self.states.values():
+                    current.wake.set()
             raise
 
     def request_stop(self):
@@ -188,23 +170,90 @@ class PostOnlyBot:
             self.shutdown_deadline = time.monotonic() + 60
             self.stop_event.set()
             self.account_wake.set()
-            with self.limiter.condition:
-                self.limiter.condition.notify_all()
+            for bucket in self.limiter.buckets.values():
+                with bucket.condition:
+                    bucket.condition.notify_all()
             for state in self.states.values():
                 state.wake.set()
 
-    def set_book(self, state, raw):
-        bids = [Decimal(str(p)) for p, q in raw.get("bids", []) if Decimal(str(q)) > 0]
-        asks = [Decimal(str(p)) for p, q in raw.get("asks", []) if Decimal(str(q)) > 0]
-        if not bids or not asks:
-            raise ValueError("盘口缺少买价或卖价")
-        bid, ask = max(bids), min(asks)
-        if not bid.is_finite() or not ask.is_finite() or not 0 < bid < ask:
-            raise ValueError("盘口价格无效")
-        state.book = (bid, ask)
-        state.book_at = time.monotonic()
+    def set_book(self, state, raw, depth=True):
+        if raw.get('market', state.market['id']) != state.market['id']:
+            raise ValueError('盘口市场不一致')
+        stamp = datetime.fromisoformat(raw['time'].replace('Z', '+00:00')).timestamp()
+        if time.time() - stamp >= BOOK_SECONDS:
+            return
+        if stamp - time.time() > BOOK_SECONDS:
+            raise ValueError('盘口时间超前，请检查系统时钟')
+        if stamp <= (state.depth_time if depth else state.book_time):
+            return
+        tick = Decimal(state.market['precision']['price'])
+        if depth and raw.get('depthLevels') is not None and Decimal(raw['depthLevels']) != tick:
+            raise ValueError('盘口聚合粒度与 tick 不一致')
+        levels = []
+        for side in ('bids', 'asks'):
+            book = {}
+            for p, q in raw[side]:
+                price, qty = Decimal(str(p)), Decimal(str(q))
+                if (not price.is_finite() or not qty.is_finite() or price <= 0 or qty < 0
+                    or price % tick):
+                    raise ValueError('盘口价格或数量无效')
+                if qty:
+                    book[price] = book.get(price, Decimal(0)) + qty
+            levels.append(book)
+        if not all(levels) or max(levels[0]) >= min(levels[1]):
+            raise ValueError('盘口缺失或交叉')
+        if depth:
+            state.depth = tuple(levels)
+            state.depth_time = stamp
+            state.depth_at = time.monotonic()
+            state.depth_seq += 1
+        if stamp >= state.book_time:
+            state.book = (max(levels[0]), min(levels[1]))
+            state.book_time = stamp
+            state.book_at = time.monotonic()
+
+    def quote_targets(self, state):
+        targets = {'buy': None, 'sell': None}
+        if not state.depth or not state.book or time.monotonic() - state.depth_at >= BOOK_SECONDS:
+            return targets
+        external = [dict(levels) for levels in state.depth]
+        for order in list(state.own_orders.values()):
+            # 未触发的条件单尚未进入盘口，不能从公开深度中扣除。
+            if order['status'] != 'open':
+                continue
+            index = 0 if order['side'] == 'buy' else 1
+            remaining = Decimal(order['size']) - Decimal(order['filledSize'])
+            price = Decimal(order['price'])
+            if remaining > external[index].get(price, Decimal(0)):
+                raise ValueError('本人订单与深度快照不同步，等待对账')
+            if remaining:
+                external[index][price] -= remaining
+        bid, ask = state.book
+        mid = (bid + ask) / 2
+        tick = Decimal(state.market['precision']['price'])
+        for index, side in enumerate(('buy', 'sell')):
+            direction = -1 if side == 'buy' else 1
+            eligible = [(p * q, abs(p - mid), p) for p, q in external[index].items()
+                        if q > 0 and 0 <= direction * (p - mid) / mid * BPS <= BAND]
+            if not eligible:
+                continue
+            wall = max(eligible)[2]
+            price = wall + direction * tick
+            distance = direction * (price - mid) / mid * BPS
+            if price > 0 and 0 < distance <= BAND and (price < bid if side == 'buy' else price > ask):
+                targets[side] = price
+        return targets
 
     def observe_order(self, state, raw):
+        oid = str(raw['orderId'])
+        previous = state.own_orders.get(oid)
+        if raw['status'] in {'fullyfilled', 'canceled'}:
+            state.own_orders.pop(oid, None)
+        else:
+            state.own_orders[oid] = dict(raw)
+        if previous != state.own_orders.get(oid):
+            state.orders_seq += 1
+            state.depth_barrier = state.depth_seq
         cid = raw.get("clientOrderId") or state.by_id.get(str(raw["orderId"]))
         entry = state.tracked.get(cid)
         if entry is None:
@@ -218,7 +267,8 @@ class PostOnlyBot:
         size = Decimal(raw["size"])
         if (
             not filled.is_finite() or not size.is_finite()
-            or size != entry["size"] or not 0 <= filled <= size
+            or size != entry["size"] or Decimal(raw['price']) != entry['price']
+            or not 0 <= filled <= size
         ):
             raise OndoFatalError(f"主单数量异常: {cid}")
         entry["id"] = order_id
@@ -228,17 +278,24 @@ class PostOnlyBot:
         status = "filled" if raw["status"] == "fullyfilled" else raw["status"]
         if status not in {"open", "pending", "untriggered", *TERMINAL}:
             raise OndoFatalError(f"未知订单状态: {status}")
+        if filled > entry['filled']:
+            state.position_dirty = True
+            state.position_refresh_at = time.monotonic() + 1
+            state.position_seq += 1
+            self.account_wake.set()
         if filled >= entry["filled"]:
             entry["filled"] = filled
             if entry["status"] not in TERMINAL or status in TERMINAL:
                 entry["status"] = status
             entry["raw"] = raw
-        entry["needs_lookup"] = False
+        entry["needs_lookup"] = status == 'pending'
+        if status == 'pending':
+            entry['retry_at'] = time.monotonic() + 1
         if filled > 0 and not entry["settled"]:
             state.partial.add(entry["side"])
 
     def accept_fills(self, state, fills):
-        """按逐笔成交去重；先保留待提交记录，失败后也不会漏掉这笔对冲。"""
+        """逐笔成交去重；净仓位只采用交易所快照，不生成反向单。"""
         for fill in fills:
             cid = fill.get("clientOrderId") or state.by_id.get(str(fill["orderId"]))
             entry = state.tracked.get(cid)
@@ -261,68 +318,8 @@ class PostOnlyBot:
                 state.position_dirty = True
                 state.position_refresh_at = time.monotonic() + 1
                 self.account_wake.set()
-            hedge_side = "sell" if fill["side"] == "buy" else "buy"
-            offset = self.config.verse / BPS
-            target = price * (1 + offset if hedge_side == "sell" else 1 - offset)
-            client = self.clients[state.symbol]
-            target = Decimal(client.price_to_precision(
-                state.symbol, target,
-                rounding=ROUND_CEILING if hedge_side == "sell" else ROUND_FLOOR,
-            ))
-            if target <= 0:
-                raise OndoFatalError("反向挂单取整后的价格必须为正")
-            state.hedges[fill["id"]] = {
-                "cid": HEDGE_PREFIX + hashlib.sha256(fill["id"].encode()).hexdigest()[:40],
-                "side": hedge_side, "size": qty, "price": target,
-                "unknown": False, "retry_at": 0, "attempts": 0,
-            }
-            log.info("%s 主单成交 %s %s @ %s", state.market["id"], fill["side"], qty, price)
-
-    async def send_hedges(self, state):
-        client = self.clients[state.symbol]
-        for fill_id, hedge in list(state.hedges.items()):
-            if time.monotonic() < hedge["retry_at"]:
-                continue
-            try:
-                if hedge["unknown"]:
-                    order = await self.rest(
-                        client, "fetch_order", "client:" + hedge["cid"], state.symbol, priority=1,
-                    )
-                else:
-                    order = await self.rest(
-                        client, "create_order", state.symbol, "limit",
-                        hedge["side"], hedge["size"], hedge["price"],
-                        {"clientOrderId": hedge["cid"], "postOnly": False}, priority=1,
-                    )
-            except OndoFatalError as exc:
-                hedge["unknown"] = True
-                hedge["retry_at"] = time.monotonic() + RECONCILE_SECONDS
-                state.fatal = str(exc)
-                self.exit_code = 1
-                log.critical("%s 对冲结果待确认，只查单不重发: %s", state.market["id"], hedge["cid"])
-                return
-            except OndoAPIError as exc:
-                if exc.uncertain:
-                    hedge["unknown"] = True
-                hedge["attempts"] += 1
-                hedge["retry_at"] = max(
-                    self.limiter.cooldown_until,
-                    time.monotonic() + min(10, 2 ** min(hedge["attempts"], 4)),
-                )
-                if exc.status != 429:
-                    log.error("%s 对冲待重试 %s: %s", state.market["id"], hedge["cid"], exc)
-                return
-            if (
-                order["clientOrderId"] != hedge["cid"]
-                or order["side"] != hedge["side"]
-                or Decimal(order["info"]["size"]) != hedge["size"]
-                or Decimal(order["info"]["price"]) != hedge["price"]
-            ):
-                raise OndoFatalError(f"对冲单内容不一致: {hedge['cid']}")
-            del state.hedges[fill_id]
-            log.info("%s 反向单 %s %s @ %s id=%s",
-                     state.market["id"], hedge["side"], hedge["size"],
-                     hedge["price"], order["id"])
+            state.depth_barrier = state.depth_seq
+            log.info('%s 主单成交 %s %s @ %s', state.market['id'], fill['side'], qty, price)
 
     async def sync_main(self, state, entry, cancel=False, priority=0):
         client = self.clients[state.symbol]
@@ -362,30 +359,40 @@ class PostOnlyBot:
             state.tracked.pop(entry["cid"], None)
             state.by_id.pop(entry["id"], None)
             state.seen.difference_update(entry["fill_ids"])
+            state.depth_barrier = state.depth_seq
             self.account_wake.set()
         elif cancel:
             raise OndoAPIError(f"撤单尚未确认: {entry['cid']}")
 
-    async def cancel_main(self, state, sides=("buy", "sell"), priority=0):
-        # 只按已登记的主单 ID 撤单；永远不调用整币或全账户撤单。
-        for side in sides:
-            cid = state.main.get(side)
-            if cid:
-                entry = state.tracked[cid]
-                if self.limiter.cooling or time.monotonic() < entry.get("retry_at", 0):
-                    continue
-                try:
-                    await self.sync_main(state, entry, cancel=True, priority=priority)
-                except OndoFatalError as exc:
-                    state.fatal = str(exc)
-                    self.exit_code = 1
-                    log.critical("%s 主单状态异常: %s", state.market["id"], cid)
-                except (OndoAPIError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
-                    entry["retry_at"] = max(time.monotonic() + 1, self.limiter.cooldown_until)
-                    if not isinstance(exc, OndoAPIError) or exc.status != 429:
-                        state.problem = str(exc)
-                        self.need_reconcile = True
-                        log.error("%s 主单撤销待确认 %s: %s", state.market["id"], cid, exc)
+    async def cancel_main(self, state, sides=('buy', 'sell'), priority=0):
+        entries = [state.tracked[state.main[s]] for s in sides if s in state.main]
+        entries = [e for e in entries if time.monotonic() >= e.get('retry_at', 0)]
+        known = [e for e in entries if e['id'] and e['status'] not in TERMINAL]
+        if known and not self.limiter.buckets['cancel'].cooling:
+            try:
+                orders = await self.rest(self.clients[state.symbol], 'cancel_orders', state.symbol,
+                                         [e['id'] for e in known], priority=priority)
+                for order in orders:
+                    self.observe_order(state, order['info'])
+            except (OndoAPIError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
+                for entry in known:
+                    entry['retry_at'] = time.monotonic() + 1
+                state.problem = str(exc)
+                self.need_reconcile = True
+                log.warning('%s 批撤待确认: %s', state.market['id'], exc)
+        for entry in entries:
+            if time.monotonic() < entry.get('retry_at', 0):
+                continue
+            try:
+                # 已批撤的非终态不重复 DELETE；下轮仍保留槽位并重试。
+                await self.sync_main(state, entry, cancel=entry not in known, priority=priority)
+                if not entry['settled']:
+                    entry['retry_at'] = time.monotonic() + 1
+            except (OndoAPIError, OndoFatalError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
+                entry['retry_at'] = time.monotonic() + 1
+                state.problem = str(exc)
+                self.need_reconcile = True
+                log.warning('%s 撤单或成交待确认: %s', state.market['id'], exc)
 
     async def refresh_positions(self, priority=3):
         versions = {s.symbol: s.position_seq for s in self.states.values()}
@@ -405,7 +412,7 @@ class PostOnlyBot:
             state.position, state.mark = quantity, mark
             state.position_dirty = False
             state.position_seq += 1
-            if abs(quantity) * mark > self.config.position_limit and not state.stopped:
+            if abs(quantity) * mark > state.position_limit and not state.stopped:
                 state.stopped = "单币仓位超过 myLimit"
                 log.warning("%s %s: %s U", state.market["id"], state.stopped, abs(quantity) * mark)
             state.wake.set()
@@ -420,6 +427,8 @@ class PostOnlyBot:
             priority = 1 if self.recovering else 3
             await self.refresh_positions(priority)
             started = time.monotonic()
+            versions = {s.symbol: s.orders_seq for s in self.states.values()}
+            own = {s.symbol: {} for s in self.states.values()}
             orders = await self.rest(
                 self.account_client, "fetch_open_orders", priority=priority,
                 valid=lambda: not self.closing and self.ws_ready,
@@ -428,13 +437,23 @@ class PostOnlyBot:
             for order in orders:
                 current = self.by_market.get(order["info"]["market"])
                 if current:
-                    self.observe_order(current, order["info"])
+                    own[current.symbol][order['id']] = order['info']
             if (
                 generation != self.generation or not self.ws_ready or self.limiter.cooling
                 or cooldown_generation != self.limiter.cooldown_generation
             ):
                 return
+            changed = False
             for current in self.states.values():
+                if current.orders_seq != versions[current.symbol]:
+                    changed = True
+                    continue
+                if current.own_orders != own[current.symbol]:
+                    current.depth_barrier = current.depth_seq
+                current.own_orders = own[current.symbol]
+                current.orders_seq += 1
+                for raw in list(current.own_orders.values()):
+                    self.observe_order(current, raw)
                 for entry in current.tracked.values():
                     if (
                         entry["id"] and entry["id"] not in open_ids
@@ -445,7 +464,7 @@ class PostOnlyBot:
                 current.synced_generation = generation
                 current.problem = ""
                 current.wake.set()
-            self.need_reconcile = False
+            self.need_reconcile = changed
             self.recovering = False
 
     async def account_loop(self):
@@ -468,32 +487,6 @@ class PostOnlyBot:
                     elif any(s.position_dirty and now >= s.position_refresh_at
                              for s in self.states.values()):
                         await self.refresh_positions(priority=1)
-                    for state in self.states.values():
-                        if (
-                            self.recovering or state.stopped or state.fatal
-                            or time.monotonic() - state.book_at < BOOK_SECONDS
-                            or time.monotonic() < state.book_retry_at
-                        ):
-                            continue
-                        state.book_refreshing = True
-                        started = time.monotonic()
-                        try:
-                            book = await self.rest(
-                                self.account_client, "fetch_order_book", state.symbol,
-                                priority=3,
-                                valid=lambda s=state: (
-                                    not self.closing and self.ws_ready and not self.recovering
-                                    and time.monotonic() - s.book_at >= BOOK_SECONDS
-                                ),
-                            )
-                            if state.book_at <= started:
-                                self.set_book(state, book["info"])
-                        except OndoRequestSkipped:
-                            pass
-                        finally:
-                            state.book_refreshing = False
-                            state.book_retry_at = time.monotonic() + BOOK_SECONDS
-                            state.wake.set()
                 except OndoRequestSkipped:
                     pass
                 except (OndoAPIError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
@@ -513,84 +506,69 @@ class PostOnlyBot:
             except asyncio.TimeoutError:
                 pass
 
-    async def place_quote(self, state, side):
-        if not self.quote_allowed(state) or time.monotonic() - state.book_at >= BOOK_SECONDS:
+    async def place_quotes(self, state, sides=('buy', 'sell')):
+        if (not self.quote_allowed(state) or state.depth_seq <= state.depth_barrier
+            or time.monotonic() - state.book_at >= BOOK_SECONDS):
             return
-        if time.monotonic() < state.retry_at.get(side, 0):
+        targets = self.quote_targets(state)
+        entries = []
+        for side in sides:
+            price = targets[side]
+            if side in state.main or price is None or time.monotonic() < state.retry_at.get(side, 0):
+                continue
+            size = Decimal(self.clients[state.symbol].amount_to_precision(state.symbol, state.order_size / price))
+            if size <= 0:
+                raise ValueError('orderSize 小于最小数量')
+            cid = MAIN_PREFIX + uuid.uuid4().hex
+            entry = {'cid': cid, 'id': None, 'side': side, 'price': price, 'size': size,
+                     'filled': Decimal(0), 'seen_size': Decimal(0), 'status': 'pending',
+                     'settled': False, 'uncertain': True, 'fill_ids': set(),
+                     'created_at': time.monotonic(), 'needs_lookup': False}
+            state.main[side] = cid
+            state.tracked[cid] = entry
+            entries.append(entry)
+        if not entries:
             return
-        client = self.clients[state.symbol]
-        mid = sum(state.book) / 2
-        step = Decimal(state.market["precision"]["price"])
-        direction = -1 if side == "buy" else 1
-        target_ticks = mid * (1 + direction * TARGET / BPS) / step
-        prices = {
-            target_ticks.to_integral_value(rounding=ROUND_FLOOR) * step,
-            target_ticks.to_integral_value(rounding=ROUND_CEILING) * step,
-        }
-        candidates = []
-        for price in prices:
-            distance = direction * (price - mid) / mid * BPS
-            if price > 0 and self.config.near_limit <= distance <= self.config.far_limit:
-                candidates.append((abs(distance - TARGET), -distance, price))
-        if not candidates:
-            state.retry_at[side] = time.monotonic() + 1
-            log.debug("%s %s 没有落在 %s~%sbps 内的合法 tick",
-                      state.market["id"], side, self.config.near_limit, self.config.far_limit)
-            return
-        price = min(candidates)[2]
-        size = Decimal(client.amount_to_precision(state.symbol, self.config.order_size / price))
-        if size <= 0:
-            raise ValueError(f"{state.market['id']} orderSize 小于最小数量")
-        cid = MAIN_PREFIX + uuid.uuid4().hex
-        entry = {
-            "cid": cid, "id": None, "side": side, "price": price, "size": size,
-            "filled": Decimal("0"), "seen_size": Decimal("0"),
-            "status": "pending", "settled": False, "uncertain": True, "fill_ids": set(),
-            "created_at": time.monotonic(), "needs_lookup": False,
-        }
-        # 网络请求前登记，风控触发时也能按客户端 ID 找回这张单。
-        state.tracked[cid] = entry
-        state.main[side] = cid
-        try:
-            def still_valid():
-                if not self.quote_allowed(state) or time.monotonic() - state.book_at >= BOOK_SECONDS:
+        def still_valid():
+            try:
+                if (not self.quote_allowed(state) or state.depth_seq <= state.depth_barrier
+                    or time.monotonic() - state.book_at >= BOOK_SECONDS):
                     return False
-                latest_mid = sum(state.book) / 2
-                distance = direction * (price - latest_mid) / latest_mid * BPS
-                return self.config.near_limit <= distance <= self.config.far_limit
-            order = await self.rest(
-                client, "create_order", state.symbol, "limit", side, size, price,
-                {"clientOrderId": cid, "postOnly": True},
-                priority=2, post_valid=still_valid,
-            )
+                latest = self.quote_targets(state)
+                return all(latest[e['side']] == e['price'] for e in entries)
+            except (ValueError, KeyError, InvalidOperation):
+                return False
+        try:
+            result = await self.rest(self.clients[state.symbol], 'create_orders', state.symbol,
+                                     [{'clientOrderId': e['cid'], 'side': e['side'],
+                                       'amount': e['size'], 'price': e['price']} for e in entries],
+                                     priority=2, post_valid=still_valid)
         except OndoRequestSkipped:
-            del state.main[side]
-            del state.tracked[cid]
-            return
-        except OndoFatalError as exc:
-            state.fatal = str(exc)
-            self.exit_code = 1
-            log.critical("%s 主单待确认: %s", state.market["id"], cid)
-            return
+            result = {'addedOrders': [], 'failedOrders': [
+                {'order': {'clientOrderId': e['cid']}, 'errorCode': 'quote_expired'} for e in entries]}
         except OndoAPIError as exc:
-            # 明确拒单才允许释放槽位；未确认的订单仍保留以便撤销。
             if exc.uncertain:
-                entry["needs_lookup"] = True
-                state.problem = f"主单结果待确认: {cid}"
-                self.need_reconcile = True
-                self.account_wake.set()
-                return
-            del state.main[side]
-            del state.tracked[cid]
-            state.retry_at[side] = max(time.monotonic() + 1, self.limiter.cooldown_until)
-            if exc.code == "post_only_has_match":
-                log.debug("%s %s Post-only 拒单，等待新盘口", state.market["id"], side)
-                return
-            raise
-        self.observe_order(state, order["info"])
-        log.info("%s 主单 %s %s @ %s id=%s",
-                 state.market["id"], side, size, price, order["id"])
-        if self.closing or self.tripped or not self.risk_ok or not self.ws_ready:
+                raise OndoFatalError('批量下单结果不明，保留客户端 ID 等待撤销') from None
+            result = {'addedOrders': [], 'failedOrders': [
+                {'order': {'clientOrderId': e['cid']}, 'errorCode': exc.code} for e in entries]}
+        for order in result['addedOrders']:
+            self.observe_order(state, order['info'])
+            log.info('%s 主单 %s %s @ %s', state.market['id'], order['side'], order['amount'], order['price'])
+        for failure in result['failedOrders']:
+            cid = failure['order']['clientOrderId']
+            entry = state.tracked[cid]
+            if failure.get('errorCode') == 'order_unconfirmed':
+                entry['needs_lookup'] = True
+                state.fatal = '下单结果待确认，只查单不重发'
+                self.exit_code = 1
+            else:
+                state.main.pop(entry['side'], None)
+                state.tracked.pop(cid, None)
+                state.retry_at[entry['side']] = time.monotonic() + 1
+                if failure.get('errorCode') not in {'quote_expired', 'post_only_has_match'}:
+                    log.warning('%s 主单拒绝: %s', state.market['id'], failure.get('errorCode'))
+        state.depth_barrier = state.depth_seq
+        if self.primary_paused(state):
             await self.cancel_main(state)
 
     async def run_market(self, state):
@@ -602,68 +580,57 @@ class PostOnlyBot:
                 fills = list(state.fills)
                 state.fills.clear()
                 self.accept_fills(state, fills)
-                if not self.limiter.cooling:
-                    if self.primary_paused(state):
-                        await self.cancel_main(state)
-                    await self.send_hedges(state)
+                stale = time.monotonic() - state.depth_at >= BOOK_SECONDS
+                if self.primary_paused(state) or stale:
+                    await self.cancel_main(state)
+                else:
                     if state.partial:
                         await self.cancel_main(state, tuple(state.partial))
-                        await self.send_hedges(state)
                     for entry in list(state.tracked.values()):
-                        if time.monotonic() < entry.get("retry_at", 0):
-                            continue
-                        if entry["status"] in TERMINAL or entry.get("needs_lookup"):
+                        if ((entry['status'] in TERMINAL or entry.get('needs_lookup'))
+                            and time.monotonic() >= entry.get('retry_at', 0)):
                             await self.sync_main(state, entry)
-                            await self.send_hedges(state)
-                    if self.quote_allowed(state) and time.monotonic() - state.book_at < BOOK_SECONDS:
-                        for side in ("buy", "sell"):
-                            if not self.quote_allowed(state):
-                                break
-                            cid = state.main.get(side)
-                            if cid:
-                                entry = state.tracked[cid]
-                                mid = sum(state.book) / 2
-                                direction = -1 if side == "buy" else 1
-                                distance = direction * (entry["price"] - mid) / mid * BPS
-                                if not self.config.near_limit <= distance <= self.config.far_limit:
-                                    priority = 0 if distance < self.config.near_limit else 2
-                                    await self.cancel_main(state, (side,), priority=priority)
-                                    await self.send_hedges(state)
-                            if side not in state.main:
-                                await self.place_quote(state, side)
-                    if time.monotonic() - state.book_at >= BOOK_SECONDS or state.position_dirty:
-                        self.account_wake.set()
+                    # 即使等待新深度，也不能让自己的主单停留在买一或卖一。
+                    best = [side for side, cid in list(state.main.items()) if state.book and
+                            (state.tracked[cid]['price'] >= state.book[0] if side == 'buy'
+                             else state.tracked[cid]['price'] <= state.book[1])]
+                    if best:
+                        await self.cancel_main(state, tuple(best))
+                    if self.quote_allowed(state) and state.depth_seq > state.depth_barrier:
+                        targets = self.quote_targets(state)
+                        changed = [side for side, cid in list(state.main.items())
+                                   if state.tracked[cid]['price'] != targets[side]]
+                        if changed:
+                            await self.cancel_main(state, tuple(changed))
+                        await self.place_quotes(state)
+                if state.position_dirty:
+                    self.account_wake.set()
             except OndoRequestSkipped:
                 pass
             except OndoFatalError as exc:
                 state.fatal = str(exc)
                 self.exit_code = 1
-                log.critical("%s 停挂: %s", state.market["id"], exc)
+                await self.cancel_main(state)
+                log.critical('%s 停挂: %s', state.market['id'], exc)
             except (OndoAPIError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
-                if not isinstance(exc, OndoAPIError) or exc.status != 429:
-                    state.problem = str(exc)
-                    state.synced_generation = -1
-                    self.need_reconcile = True
-                    log.error("%s 暂停主单: %s", state.market["id"], exc)
-                    for entry in state.tracked.values():
-                        entry["retry_at"] = time.monotonic() + 1
-                    self.account_wake.set()
-                    await self.cancel_main(state)
+                state.problem = str(exc)
+                self.need_reconcile = True
+                self.account_wake.set()
+                await self.cancel_main(state)
+                log.warning('%s 暂停主单: %s', state.market['id'], exc)
             except Exception:
-                log.exception("%s 程序异常，开始退出清理", state.market["id"])
+                log.exception('%s 程序异常，退出清理', state.market['id'])
                 self.exit_code = 1
                 self.request_stop()
             if self.closing:
-                if not state.main and not state.hedges and not state.fills and not state.updates:
+                if not state.main and not state.fills and not state.updates:
                     break
                 if time.monotonic() >= self.shutdown_deadline:
                     self.exit_code = 1
-                    log.critical("%s 退出清理未完成，主单=%s，待对冲=%s",
-                                 state.market["id"], list(state.main.values()),
-                                 [h["cid"] for h in state.hedges.values()])
+                    log.critical('%s 退出清理未完成: %s', state.market['id'], list(state.main.values()))
                     break
             try:
-                await asyncio.wait_for(state.wake.wait(), timeout=0.25)
+                await asyncio.wait_for(state.wake.wait(), timeout=0.1)
             except asyncio.TimeoutError:
                 pass
 
@@ -726,7 +693,7 @@ class PostOnlyBot:
                               "查询异常/等待" if not self.risk_ok else "监控中")
                     print(
                         f"{datetime.now():%Y-%m-%d %H:%M:%S} | 保证金率={ratio} | "
-                        f"总杠杆={leverage} | 数据年龄={age} | rps={self.config.rps} | "
+                        f"总杠杆={leverage} | 数据年龄={age} | 下单/撤单=2/2 RPS | "
                         f"主单={status}", flush=True,
                     )
                     next_display = now + RISK_SECONDS
@@ -743,7 +710,9 @@ class PostOnlyBot:
             self.ws_ready = False
             self.generation += 1
             for state in self.states.values():
-                state.book_at = 0
+                state.book_at = state.depth_at = 0
+                state.book_time = state.depth_time = 0
+                state.depth_barrier = state.depth_seq
                 state.synced_generation = -1
                 state.wake.set()
             try:
@@ -764,6 +733,8 @@ class PostOnlyBot:
                         if state is None:
                             continue
                         if channel == "topOfBooksPerps":
+                            self.set_book(state, raw, depth=False)
+                        elif channel == 'depthBooksPerps':
                             self.set_book(state, raw)
                         elif channel == "fillsPerps":
                             state.position_seq += 1
@@ -781,7 +752,7 @@ class PostOnlyBot:
                             state.mark = mark
                             if (
                                 not state.position_dirty
-                                and abs(state.position) * mark > self.config.position_limit
+                                and abs(state.position) * mark > state.position_limit
                                 and not state.stopped
                             ):
                                 state.stopped = "单币仓位超过 myLimit"
@@ -794,7 +765,7 @@ class PostOnlyBot:
                                 or (quantity > 0 and mark <= 0)
                             ):
                                 raise ValueError("无效仓位推送")
-                            if quantity * mark > self.config.position_limit and not state.stopped:
+                            if quantity * mark > state.position_limit and not state.stopped:
                                 state.stopped = "单币仓位超过 myLimit"
                                 log.warning("%s %s", state.market["id"], state.stopped)
                             if raw["direction"] not in {"long", "short", "neutral"}:
@@ -859,7 +830,7 @@ class PostOnlyBot:
 
 
 async def main(config):
-    limiter = RequestLimiter(config.rps)
+    limiter = AccountLimiter()
     risk_client = OndoExchange.from_env(limiter)
     account_client = None
     clients = {}
@@ -905,10 +876,10 @@ if __name__ == "__main__":
             format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout,
         )
         if args.check:
-            print(f"配置有效: {', '.join(config.symbols)} | orderSize={config.order_size} | "
-                  f"myLimit={config.position_limit} | verse={config.verse}bps | "
-                  f"nearLimit={config.near_limit}bps | farLimit={config.far_limit}bps | rps={config.rps} | "
-                  f"MMR={config.mmr:.2%} | leverage={config.max_leverage}x")
+            for i, market in enumerate(config.markets, 1):
+                print(f'{market.symbol}: orderSize={market.order_size} U/侧 | myLimit={market.position_limit} U')
+            print(f'v2.0 | ±5bps | 深度WS/不限档 | 退后1 tick | Post-only | 下单/撤单=2/2 RPS | '
+                  f'MMR={config.mmr:.2%} | leverage={config.max_leverage}x | 无反向单')
         else:
             sys.exit(asyncio.run(main(config)))
     except KeyboardInterrupt:

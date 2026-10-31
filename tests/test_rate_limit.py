@@ -141,6 +141,49 @@ class LimiterTests(unittest.TestCase):
         self.assertEqual(limiter.defer(), 2)
 
 
+class CategoryLimiterTests(unittest.TestCase):
+    def test_independent_smooth_write_budgets_and_read_bucket(self):
+        account = adapter.AccountLimiter()
+        clock = Clock()
+        for bucket in account.buckets.values():
+            bucket.clock = clock
+            bucket.wait = clock.wait
+        place = account.bucket('POST', '/v1/perps/orders/batch')
+        cancel = account.bucket('DELETE', '/v1/perps/orders/batch')
+        read = account.bucket('GET', '/v1/perps/positions')
+        self.assertIsNot(place, cancel)
+        place.acquire()
+        cancel.acquire()
+        read.acquire()
+        self.assertEqual(clock(), 0)
+        place.acquire()
+        self.assertAlmostEqual(clock(), .5)
+        cancel.acquire()
+        self.assertAlmostEqual(clock(), .5)
+        place.defer(10)
+        cancel.acquire()
+        self.assertLess(clock(), 2)
+        self.assertFalse(cancel.cooling)
+        self.assertTrue(place.cooling)
+
+    def test_transport_429_only_cools_failed_category(self):
+        account = adapter.AccountLimiter()
+        clock = Clock()
+        for bucket in account.buckets.values():
+            bucket.clock = clock
+            bucket.wait = clock.wait
+        client = OndoExchange('fake-key', 'fake-secret', limiter=account)
+        self.addCleanup(client.close)
+        client._session.send = Mock(side_effect=[response(429, {'success':False}, {'Retry-After':'5'}),
+                                                  response()])
+        with self.assertRaises(OndoAPIError):
+            client._request('POST', '/v1/perps/orders/batch', body={'orders':[]})
+        client._request('DELETE', '/v1/perps/orders/batch', params={'orderIDs':'1'})
+        self.assertEqual(clock(), 0)
+        self.assertTrue(account.buckets['place'].cooling)
+        self.assertFalse(account.buckets['cancel'].cooling)
+
+
 class TransportTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()

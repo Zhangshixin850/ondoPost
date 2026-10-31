@@ -110,6 +110,36 @@ class RequestLimiter:
             self.condition.notify_all()
 
 
+class AccountLimiter:
+    """同账户下单、撤单各 2 RPS；查询独立平滑调度，不使用突发额度。"""
+
+    def __init__(self):
+        self.buckets = {name: RequestLimiter(rate) for name, rate in
+                        (("place", 2), ("cancel", 2), ("read", 5))}
+        for bucket in self.buckets.values():
+            bucket.normal_rps = bucket.rps
+
+    def bucket(self, method, path):
+        name = "place" if method == "POST" else "cancel" if method == "DELETE" else "read"
+        return self.buckets[name]
+
+    @property
+    def cooling(self):
+        return any(b.cooling for b in self.buckets.values())
+
+    @property
+    def cooldown_until(self):
+        return max(b.cooldown_until for b in self.buckets.values())
+
+    @property
+    def cooldown_generation(self):
+        return sum(b.cooldown_generation for b in self.buckets.values())
+
+    def stop(self):
+        for bucket in self.buckets.values():
+            bucket.stop()
+
+
 class OndoExchange:
     id = "ondo"
 
@@ -148,7 +178,7 @@ class OndoExchange:
         self._markets = {}
         self._markets_by_id = {}
         self._closed = False
-        self.limiter = limiter or RequestLimiter()
+        self.limiter = limiter or AccountLimiter()
         self._request_local = threading.local()
 
     @classmethod
@@ -184,7 +214,9 @@ class OndoExchange:
             return ((valid is None or valid())
                     and (method != "POST" or post_valid is None or post_valid()))
         # 等待额度后才构造和签名，避免时间戳在队列中失效。
-        self.limiter.acquire(priority, allowed)
+        limiter = (self.limiter.bucket(method, path)
+                   if isinstance(self.limiter, AccountLimiter) else self.limiter)
+        limiter.acquire(priority, allowed)
         body_text = (
             json.dumps(body, separators=(",", ":")) if body is not None else ""
         )
@@ -234,13 +266,13 @@ class OndoExchange:
                             retry_after = max(0, parsedate_to_datetime(header).timestamp() - time.time())
                         except (TypeError, ValueError, OverflowError):
                             pass
-                delay = self.limiter.defer(retry_after)
+                delay = limiter.defer(retry_after)
                 try:
                     payload = response.json()
                 except ValueError:
                     payload = {}
                 raise OndoAPIError(
-                    "Ondo HTTP 429: account rate limit; all REST requests paused",
+                    "Ondo HTTP 429: request category rate limited",
                     code="too_many_requests", status=429, retry_after=delay,
                     uncertain=method in {"POST", "DELETE"} and (
                         not isinstance(payload, dict) or payload.get("success") is not False
@@ -538,6 +570,97 @@ class OndoExchange:
             f"Cannot confirm Ondo order client_id={client_id}; stopping to avoid duplicates"
         )
 
+    def create_orders(self, symbol, orders):
+        """一批只 POST 一次；逐项确认，未知结果保留给主程序查单。"""
+        if not orders or len(orders) > 20:
+            raise ValueError("Use 1..20 orders per batch")
+        market = self.market(symbol)
+        requests = {}
+        for item in orders:
+            cid = item["clientOrderId"]
+            if not isinstance(cid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", cid) or cid in requests:
+                raise ValueError("Invalid or duplicate clientOrderId")
+            size = self.amount_to_precision(symbol, item["amount"])
+            price = self.price_to_precision(symbol, item["price"])
+            if item["side"] not in {"buy", "sell"} or min(Decimal(size), Decimal(price)) <= 0:
+                raise ValueError("Invalid batch order")
+            requests[cid] = {
+                "market": market["id"], "type": "limit", "side": item["side"],
+                "size": size, "price": price, "clientOrderId": cid,
+                "timeInForce": "GTC", "postOnly": True, "reduceOnly": False,
+            }
+        try:
+            response = self._request("POST", "/v1/perps/orders/batch",
+                                     body={"orders": list(requests.values())})
+        except OndoAPIError as exc:
+            if not exc.uncertain:
+                raise
+            response = {}
+        added, failed = {}, {}
+        try:
+            result = response["result"]
+            if not isinstance(result["addedOrders"], list) or not isinstance(result["failedOrders"], list):
+                raise ValueError("Invalid batch response")
+            for raw in result["addedOrders"]:
+                cid = raw["clientOrderId"]
+                request = requests[cid]
+                order = self._parse_order(raw)
+                if (cid in added or raw["market"] != market["id"] or raw["side"] != request["side"]
+                    or Decimal(raw["size"]) != Decimal(request["size"])
+                    or Decimal(raw["price"]) != Decimal(request["price"])
+                    or order["id"] in {o["id"] for o in added.values()}):
+                    raise ValueError("Inconsistent batch order")
+                added[cid] = order
+            for item in result["failedOrders"]:
+                cid = item["order"]["clientOrderId"]
+                if cid not in requests or cid in added or cid in failed:
+                    raise ValueError("Inconsistent batch failure")
+                failed[cid] = item
+        except (KeyError, ValueError, TypeError, InvalidOperation):
+            added, failed = {}, {}
+        # 没有明确回执的项只查原客户端 ID，绝不整批重发。
+        for cid, request in requests.items():
+            if cid in added or cid in failed:
+                continue
+            try:
+                order = self.fetch_order("client:" + cid, symbol)
+                raw = order["info"]
+                if (raw["side"] != request["side"] or Decimal(raw["size"]) != Decimal(request["size"])
+                    or Decimal(raw["price"]) != Decimal(request["price"])):
+                    raise ValueError("Mismatched batch lookup")
+                added[cid] = order
+            except (OndoAPIError, OndoRequestSkipped, ValueError, KeyError, TypeError):
+                failed[cid] = {"order": request, "errorCode": "order_unconfirmed"}
+        return {"addedOrders": list(added.values()), "failedOrders": list(failed.values())}
+
+    def cancel_orders(self, symbol, order_ids):
+        """返回逐单终态；批撤超时或失败时用 GET 确认，未知项不释放槽位。"""
+        ids = list(dict.fromkeys(str(value) for value in order_ids))
+        if not ids or len(ids) > 20:
+            raise ValueError("Use 1..20 cancellations per batch")
+        market = self.market(symbol)
+        try:
+            response = self._request("DELETE", "/v1/perps/orders/batch",
+                                     params={"orderIDs": ",".join(ids)})
+        except OndoAPIError as exc:
+            if not exc.uncertain:
+                raise
+            response = {}
+        confirmed = {}
+        for raw in (response.get("result") or {}).get("successfulCancels", []):
+            try:
+                order = self._parse_order(raw)
+                if (order["id"] in ids and raw["market"] == market["id"]
+                    and order["status"] in {"canceled", "filled"}):
+                    confirmed[order["id"]] = order
+            except (KeyError, ValueError, TypeError, InvalidOperation):
+                pass
+        for order_id in ids:
+            if order_id not in confirmed:
+                # 即使未撤成功也返回最新订单，主程序保留并重试撤销。
+                confirmed[order_id] = self.fetch_order(order_id, symbol)
+        return list(confirmed.values())
+
     def fetch_order(self, order_id, symbol):
         order = self._parse_order(
             self._request("GET", f"/v1/perps/orders/{order_id}")["result"]
@@ -610,7 +733,7 @@ class OndoExchange:
         from websockets.asyncio.client import connect
 
         channels = {
-            "topOfBooksPerps", "markPricesPerps",
+            "topOfBooksPerps", "depthBooksPerps", "markPricesPerps",
             "ordersPerps", "fillsPerps", "positionsPerps",
         }
         async with connect(
@@ -653,6 +776,14 @@ class OndoExchange:
                 elif message.get("type") == "loggedIn" and not logged_in:
                     logged_in = True
                     for channel in sorted(channels):
+                        if channel == "depthBooksPerps":
+                            for market_id in markets:
+                                await ws.send(json.dumps({
+                                    "op": "subscribe", "channel": channel,
+                                    "markets": [market_id], "limit": 0,
+                                    "depthLevels": self.market(market_id)["precision"]["price"],
+                                }))
+                            continue
                         request = {"op": "subscribe", "channel": channel}
                         if channel != "positionsPerps":
                             request["markets"] = list(markets)

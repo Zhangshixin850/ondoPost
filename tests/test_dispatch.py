@@ -1,277 +1,369 @@
 import asyncio
-import contextlib
 import copy
-import io
 import os
+import contextlib
+import io
+import runpy
+import sys
 import time
 import unittest
 from decimal import Decimal as D
-from unittest.mock import Mock, patch
+from unittest.mock import patch, Mock
 
 import postOnly as app
-from ondo_exchange import OndoAPIError, OndoExchange, RequestLimiter
-from test_bot import FakeExchange, fixture, until
+from ondo_exchange import AccountLimiter, OndoAPIError, OndoExchange, RequestLimiter
+from test_bot import FakeExchange, fixture, push_book, until
 
 
 class ConfigTests(unittest.TestCase):
     def config(self, **settings):
-        env = {"symbol1": "CRCL", "symbol2": "SNDK", "symbol3": "",
-               "orderSize": "1000", "myLimit": "5000",
-               "nearLimit": "2", "farLimit": "4.9", "rps": "5"}
+        env = {'symbol1': 'TEST', 'orderSize1': '1000', 'myLimit1': '5000',
+               'symbol2': '', 'symbol3': ''}
         env.update(settings)
-        with patch.dict(os.environ, env, clear=True), patch.object(app, "load_dotenv"):
+        with patch.dict(os.environ, env, clear=True), patch.object(app, 'load_dotenv'):
             return app.Config.from_env()
 
-    def test_empty_slots_are_disabled(self):
-        self.assertEqual(self.config().symbols, ("CRCL", "SNDK"))
-        self.assertEqual(self.config(symbol1="", symbol2="sndk").symbols, ("SNDK",))
-        self.assertEqual(self.config(symbol1="", symbol2="", symbol3="soxl").symbols, ("SOXL",))
+    def test_per_market_sizes_and_disabled_slot(self):
+        c = self.config(symbol3='sndk', orderSize3='250', myLimit3='1500', orderSize2='invalid')
+        self.assertEqual(c.symbols, ('TEST', 'SNDK'))
+        self.assertEqual([m.order_size for m in c.markets], [D(1000), D(250)])
+        self.assertEqual(c.markets[1].position_limit, D(1500))
+        self.assertEqual((c.mmr, c.max_leverage), (D('.2'), D(5)))
 
-    def test_all_empty_or_duplicate_symbols_are_rejected(self):
-        for settings in (dict(symbol1="", symbol2=""), dict(symbol2="crcl")):
+    def test_invalid_values_and_symbols(self):
+        for settings in ({'symbol1': ''}, {'symbol2': 'test'}, {'orderSize1': ''},
+                         {'orderSize1': 'NaN'}, {'myLimit1': '-1'}, {'MMR': '0'}, {'leverage': 'Infinity'}):
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 self.config(**settings)
 
-    def test_rps_and_band_validation(self):
-        for rps in ("1", "5", "10"):
-            self.assertEqual(self.config(rps=rps).rps, int(rps))
-        for rps in ("0", "-1", "1.5", "NaN", "", "abc"):
-            with self.subTest(rps=rps), self.assertRaises(ValueError):
-                self.config(rps=rps)
-        for settings in (
-            dict(nearLimit="0"), dict(nearLimit="5"), dict(farLimit="3.9"),
-            dict(nearLimit="4", farLimit="4"), dict(farLimit="NaN"),
-        ):
-            with self.subTest(settings=settings), self.assertRaises(ValueError):
-                self.config(**settings)
+    def test_check_cli_prints_per_market_settings_without_network(self):
+        env={'symbol1':'CRCL','orderSize1':'250','myLimit1':'1500','symbol2':'','symbol3':''}
+        output=io.StringIO()
+        with patch.dict(os.environ,env,clear=True), patch('dotenv.load_dotenv'), \
+             patch.object(sys,'argv',['postOnly.py','--check']), \
+             patch.object(OndoExchange,'from_env',side_effect=AssertionError('Network forbidden')), \
+             contextlib.redirect_stdout(output):
+            runpy.run_path('postOnly.py',run_name='__main__')
+        self.assertIn('orderSize=250',output.getvalue())
+        self.assertIn('myLimit=1500',output.getvalue())
+        self.assertIn('2/2 RPS',output.getvalue())
 
 
-class DispatchTests(unittest.IsolatedAsyncioTestCase):
+class WallTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.exchange, self.bot, self.state = fixture()
         self.addCleanup(self.exchange.close)
 
-    async def test_startup_preflight_retries_only_rate_limited_read(self):
-        calls = 0
-        def orders():
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise OndoAPIError("rate limited", status=429, retry_after=2)
-            return [{"symbol": "OTHER/USDT:USDT", "clientOrderId": "po_q_old"}]
-        with patch.object(self.exchange, "fetch_open_orders", side_effect=orders):
-            with self.assertRaisesRegex(RuntimeError, "遗留主单"):
-                await self.bot.run()
-        self.assertEqual(calls, 2)
-        self.assertFalse(self.exchange.posts())
+    async def test_largest_level_one_tick_behind_in_one_batch(self):
+        await self.bot.place_quotes(self.state)
+        self.assertEqual([(o['side'], D(o['price'])) for o in self.exchange.posts()],
+                         [('buy', D('99.97')), ('sell', D('100.03'))])
+        self.assertEqual(sum(m == 'POST' and p.endswith('/batch') for m,p,b in self.exchange.calls), 1)
+        for o in self.exchange.posts():
+            self.assertTrue(o['postOnly'])
+            self.assertFalse(o['reduceOnly'])
+            self.assertLessEqual(D(o['size']) * D(o['price']), D(1000))
 
-    async def test_market_initialization_retries_429_without_writing_orders(self):
-        config = app.Config(("TEST", "TEST-USD.P"), D("1000"), D("5000"),
-                            D("3"), D(".2"), D("5"))
-        attempts = [OndoAPIError("rate limited", status=429), self.exchange._markets]
-        with patch.object(app.OndoExchange, "from_env", return_value=self.exchange), \
-                patch.object(self.exchange, "load_markets", side_effect=attempts) as load:
-            with self.assertRaisesRegex(ValueError, "相同市场"):
-                await app.main(config)
-        self.assertEqual(load.call_count, 2)
-        self.assertFalse(self.exchange.posts())
+    async def test_own_manual_and_main_orders_are_subtracted(self):
+        manual = self.exchange.create_order('TEST', 'limit', 'buy', '100', '99.96', {'clientOrderId': 'manual'})
+        self.bot.observe_order(self.state, manual['info'])
+        push_book(self.exchange, self.bot, self.state)
+        self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.97'))
+        await self.bot.place_quotes(self.state)
+        push_book(self.exchange, self.bot, self.state)
+        self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.97'))
 
-    async def test_queued_quote_is_dropped_if_price_or_risk_changes(self):
-        for change in ("price", "risk"):
-            with self.subTest(change=change):
-                exchange, bot, state = fixture()
-                try:
-                    clock = [0.0]
-                    def wait(seconds):
-                        clock[0] += seconds
-                        if change == "price":
-                            bot.set_book(state, {"bids": [["100.09", "1"]],
-                                                 "asks": [["100.11", "1"]]})
-                        else:
-                            bot.tripped = "risk tripped while queued"
-                    limiter = RequestLimiter(1, clock=lambda: clock[0], wait=wait)
-                    bot.limiter = exchange.limiter = limiter
-                    limiter.acquire(priority=0)
-                    exchange._request = OndoExchange._request.__get__(exchange)
-                    exchange._session.send = Mock()
-                    await bot.place_quote(state, "buy")
-                    exchange._session.send.assert_not_called()
-                    self.assertFalse(state.main)
-                    self.assertFalse(state.tracked)
-                finally:
-                    exchange.close()
+    def test_wall_uses_notional_and_tie_prefers_further_price(self):
+        raw = {'bids': [['99.99', '1'], ['99.98', '99.96'], ['99.96', '99.98']],
+               'asks': [['100.01', '1'], ['100.02', '1']]}
+        push_book(self.exchange, self.bot, self.state, raw)
+        self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.95'))
 
-    async def test_position_snapshot_is_not_incremented_again_by_fill(self):
-        await self.bot.place_quote(self.state, "buy")
-        fill = self.exchange.fill("1", "1")
-        self.state.position = D("8")
-        self.state.position_seq = 10
-        self.state.position_dirty = False
-        fill["_position_seq"] = 9
-        self.bot.accept_fills(self.state, [fill])
-        self.assertEqual(self.state.position, D("8"))
-        self.assertFalse(self.state.position_dirty)
-        self.assertEqual(len(self.state.hedges), 1)
+    def test_outside_boundary_pauses_without_second_choice(self):
+        raw = {'bids': [['99.99','1'], ['99.95','100']], 'asks': [['100.01','1'], ['100.04','100']]}
+        push_book(self.exchange, self.bot, self.state, raw)
+        self.assertIsNone(self.bot.quote_targets(self.state)['buy'])
+        self.assertEqual(self.bot.quote_targets(self.state)['sell'], D('100.05'))
 
-    async def test_configured_band_keeps_order_between_two_and_three_bps(self):
-        await self.bot.place_quote(self.state, "buy")
-        self.bot.set_book(self.state, {"bids": [["99.975", "1"]],
-                                       "asks": [["99.995", "1"]]})
+    def test_coarse_tick_no_valid_quote(self):
+        raw = {'bids': [['5.22','2000']], 'asks': [['5.25','2000']]}
+        push_book(self.exchange, self.bot, self.state, raw)
+        self.assertEqual(self.bot.quote_targets(self.state), {'buy':None,'sell':None})
+
+    def test_bad_self_deduction_pauses(self):
+        self.state.own_orders['manual'] = {'side':'buy','price':'99.98','size':'100','filledSize':'0','status':'open'}
+        with self.assertRaisesRegex(ValueError, '不同步'):
+            self.bot.quote_targets(self.state)
+
+    def test_snapshots_replace_reject_old_and_grouped(self):
+        raw = push_book(self.exchange, self.bot, self.state)
+        count = self.state.depth_seq
+        self.bot.set_book(self.state, raw)
+        self.assertEqual(self.state.depth_seq, count)
+        raw['bids'] = [['99.99','1']]
+        push_book(self.exchange, self.bot, self.state, raw)
+        self.assertEqual(len(self.state.depth[0]), 1)
+        raw['depthLevels'] = '0.1'
+        with self.assertRaises(ValueError):
+            push_book(self.exchange, self.bot, self.state, raw)
+
+    def test_untriggered_manual_order_is_not_resting_liquidity(self):
+        self.state.own_orders['stop']={'side':'buy','price':'0','size':'100','filledSize':'0',
+                                       'status':'untriggered'}
+        self.assertEqual(self.bot.quote_targets(self.state)['buy'],D('99.97'))
+
+    async def test_stale_depth_cancels_and_no_new_quotes(self):
+        await self.bot.place_quotes(self.state)
+        self.state.depth_at -= 10
         worker = asyncio.create_task(self.bot.run_market(self.state))
         try:
-            await asyncio.sleep(.06)
-            self.assertEqual(self.exchange.orders["1"]["status"], "open")
-            self.assertFalse(any(m == "DELETE" for m, p, b in self.exchange.calls))
-        finally:
-            self.bot.request_stop()
-            await asyncio.wait_for(worker, 3)
-
-    async def test_high_frequency_positions_do_not_trigger_per_message_rest(self):
-        completed = asyncio.Event()
-
-        async def stream(markets):
-            yield {"type": "ready"}
-            for _ in range(300):
-                yield {"type": "update", "channel": "positionsPerps", "data": [{
-                    "market": "TEST-USD.P", "netQuantity": "0",
-                    "direction": "neutral", "markPrice": "100",
-                }]}
-                yield {"type": "update", "channel": "topOfBooksPerps",
-                       "data": [{"market": "TEST-USD.P", **self.exchange.book}]}
-                await asyncio.sleep(0)
-            completed.set()
-            await self.bot.stop_event.wait()
-
-        self.exchange.stream = stream
-        self.bot.ws_ready = False
-        self.state.synced_generation = -1
-        self.state.position_dirty = True
-        tasks = [asyncio.create_task(self.bot.feed_loop()),
-                 asyncio.create_task(self.bot.account_loop()),
-                 asyncio.create_task(self.bot.run_market(self.state))]
-        try:
-            await asyncio.wait_for(completed.wait(), 3)
-            await until(lambda: len(self.state.main) == 2)
-            await asyncio.sleep(.1)
-            self.assertLessEqual(sum(p == "/v1/perps/positions" for m, p, b in self.exchange.calls), 2)
-            self.assertLessEqual(sum(p == "/v1/perps/orders" and m == "GET"
-                                     for m, p, b in self.exchange.calls), 2)
+            await until(lambda: not self.state.main)
             self.assertEqual(len(self.exchange.posts()), 2)
         finally:
             self.bot.request_stop()
-            tasks[0].cancel()
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 4)
+            await worker
 
-    async def test_cooldown_is_not_broken_by_market_wakeups(self):
-        await self.bot.place_quote(self.state, "buy")
-        fill = self.exchange.fill("1", "1")
-        self.bot.accept_fills(self.state, [fill])
-        clock = [0.0]
-        limiter = RequestLimiter(5, clock=lambda: clock[0])
-        self.bot.limiter = self.exchange.limiter = limiter
-        limiter.defer(2)
-        self.bot.recovering = True
-        self.exchange.calls.clear()
-        worker = asyncio.create_task(self.bot.run_market(self.state))
-        try:
-            for _ in range(100):
-                self.state.wake.set()
-                await asyncio.sleep(0)
-            self.assertFalse(self.exchange.calls)
-            self.assertEqual(len(self.state.hedges), 1)
-        finally:
-            clock[0] = 3
-            self.bot.request_stop()
-            await asyncio.wait_for(worker, 4)
+    async def test_partial_fill_only_replaces_filled_side_full_notional(self):
+        await self.bot.place_quotes(self.state)
+        sell = self.state.main['sell']
+        fill = self.exchange.fill('1','2')
+        self.bot.accept_fills(self.state,[fill,fill])
+        self.assertEqual(self.state.tracked[self.state.main['buy']]['seen_size'],D(2))
+        await self.bot.cancel_main(self.state,('buy',))
+        self.assertNotIn('buy',self.state.main)
+        self.assertEqual(self.state.main['sell'],sell)
+        await self.bot.refresh_positions()
+        push_book(self.exchange,self.bot,self.state)
+        await self.bot.place_quotes(self.state)
+        self.assertEqual(len(self.exchange.posts()),3)
+        self.assertGreater(D(self.exchange.posts()[-1]['size'])*D(self.exchange.posts()[-1]['price']),D(999))
+        self.assertTrue(all(o['postOnly'] for o in self.exchange.posts()))
 
-    async def test_rate_limited_order_lookup_never_resubmits_hedge(self):
-        await self.bot.place_quote(self.state, "buy")
-        self.bot.accept_fills(self.state, [self.exchange.fill("1", "1")])
-        original = self.exchange._request
-        rejected = False
+    async def test_fill_during_cancel_is_accounted_and_waits_for_position(self):
+        await self.bot.place_quotes(self.state)
+        self.exchange.cancel_fill='1'
+        await self.bot.cancel_main(self.state,('buy',))
+        self.assertTrue(self.state.position_dirty)
 
-        def request(method, path, **kwargs):
-            nonlocal rejected
-            if method == "GET" and "/client:" in path and not rejected:
-                rejected = True
-                raise OndoAPIError("rate limited", code="too_many_requests", status=429, retry_after=2)
-            return original(method, path, **kwargs)
+        self.assertNotIn('buy',self.state.main)
+        push_book(self.exchange,self.bot,self.state)
+        await self.bot.place_quotes(self.state)
+        self.assertEqual(len(self.exchange.posts()),2)
 
-        self.exchange.submit_mode = "accepted"
-        with patch.object(self.exchange, "_request", side_effect=request):
-            await self.bot.send_hedges(self.state)
-        hedge = next(iter(self.state.hedges.values()))
-        self.assertTrue(hedge["unknown"])
-        self.assertFalse(self.state.fatal)
+    async def test_unknown_batch_never_resubmitted(self):
+        self.exchange.submit_mode='missing'
+        await self.bot.place_quotes(self.state)
+        self.assertTrue(self.state.fatal)
         count = len(self.exchange.posts())
-        self.bot.limiter.cooldown_until = 0
-        hedge["retry_at"] = 0
-        await self.bot.send_hedges(self.state)
-        self.assertFalse(self.state.hedges)
-        self.assertEqual(len(self.exchange.posts()), count)
+        await self.bot.place_quotes(self.state)
+        self.assertEqual(len(self.exchange.posts()),count)
+        self.assertEqual(sum(m=='POST' and p.endswith('/batch') for m,p,b in self.exchange.calls),1)
+        self.assertEqual(len(self.state.main),2)
 
-    async def test_initial_preflight_detects_main_orders_in_disabled_market(self):
-        market = copy.deepcopy(self.exchange.market("TEST"))
-        market.update(id="OTHER-USD.P", symbol="OTHER/USDT:USDT", base="OTHER")
-        self.exchange._markets[market["symbol"]] = market
-        self.exchange._markets_by_id[market["id"]] = market
-        self.exchange.orders["old"] = {
-            "orderId": "old", "clientOrderId": "po_q_old_run",
-            "market": "OTHER-USD.P", "price": "100", "size": "1",
-            "filledSize": "0", "side": "buy", "status": "open",
-        }
-        with self.assertRaisesRegex(RuntimeError, "未启用市场"):
-            await self.bot.run()
+    async def test_position_limit_latched(self):
+        self.exchange.position_qty=D(51)
+        await self.bot.refresh_positions()
+        self.assertTrue(self.state.stopped)
+        self.exchange.position_qty=D(0)
+        await self.bot.refresh_positions()
+        self.assertFalse(self.bot.quote_allowed(self.state))
 
-    async def test_account_reconciliation_is_shared_across_markets(self):
-        clients = {}
-        for base in ("AAA", "BBB"):
-            exchange = FakeExchange()
-            self.addCleanup(exchange.close)
-            market = copy.deepcopy(exchange.market("TEST"))
-            market.update(id=base + "-USD.P", symbol=base + "/USDT:USDT", base=base)
-            exchange._markets = {market["symbol"]: market}
-            exchange._markets_by_id = {market["id"]: market}
-            clients[market["symbol"]] = exchange
-        account = FakeExchange()
-        self.addCleanup(account.close)
-        account._markets = {k: c.market(k) for k, c in clients.items()}
-        account._markets_by_id = {m["id"]: m for m in account._markets.values()}
-        bot = app.PostOnlyBot(self.bot.config, account, clients, account)
-        bot.ws_ready = True
-        await bot.reconcile()
-        self.assertEqual(sum(p == "/v1/perps/positions" for m, p, b in account.calls), 1)
-        self.assertEqual(sum(p == "/v1/perps/orders" for m, p, b in account.calls), 1)
-        self.assertFalse(any(client.calls for client in clients.values()))
-
-    async def test_old_rest_snapshot_does_not_overwrite_newer_position_push(self):
-        original = self.exchange.fetch_positions
-
-        def snapshot(*args):
-            self.state.position = D("7")
-            self.state.position_seq += 1
-            self.state.position_dirty = False
-            return original(*args)
-
-        with patch.object(self.exchange, "fetch_positions", side_effect=snapshot):
-            await self.bot.refresh_positions()
-        self.assertEqual(self.state.position, D("7"))
-
-    async def test_risk_display_continues_during_cooldown(self):
-        self.bot.last_risk = {"marginRatio": D(".1"), "leverage": D("2")}
-        self.bot.risk_at = time.monotonic()
-        self.bot.recovering = True
-        self.bot.limiter.defer(2)
-        output = io.StringIO()
-        with patch.object(app, "RISK_SECONDS", .02), contextlib.redirect_stdout(output):
-            task = asyncio.create_task(self.bot.risk_loop())
-            await asyncio.sleep(.08)
+    async def test_best_quote_is_canceled_while_waiting_for_depth(self):
+        await self.bot.place_quotes(self.state)
+        from datetime import datetime, timezone
+        stamp=max(time.time(),self.state.book_time+.001)
+        self.bot.set_book(self.state, {'time':datetime.fromtimestamp(stamp,timezone.utc).isoformat(),
+                          'bids':[['99.97','10']], 'asks':[['100.01','1']]}, depth=False)
+        worker=asyncio.create_task(self.bot.run_market(self.state))
+        try:
+            await until(lambda:'buy' not in self.state.main)
+            self.assertIn('sell',self.state.main)
+        finally:
             self.bot.request_stop()
-            await task
-        self.assertIn("冷却/恢复中", output.getvalue())
-        self.assertIn("数据年龄=", output.getvalue())
-        self.assertFalse(any(p == "/v1/perps/balance" for m, p, b in self.exchange.calls))
+            await worker
 
+    async def test_pre_send_validation_rejects_changed_wall(self):
+        clock=[0.0]
+        def wait(delay):
+            clock[0]+=delay
+            push_book(self.exchange,self.bot,self.state,
+                      {'bids':[['99.99','100']], 'asks':[['100.01','100']]})
+        limiter=RequestLimiter(2,clock=lambda:clock[0],wait=wait)
+        limiter.normal_rps=2
+        self.bot.limiter.buckets['place']=limiter
+        limiter.acquire()
+        self.exchange._request=OndoExchange._request.__get__(self.exchange)
+        self.exchange._session.send=Mock()
+        await self.bot.place_quotes(self.state)
+        self.exchange._session.send.assert_not_called()
+        self.assertFalse(self.state.main)
 
-if __name__ == "__main__":
-    unittest.main()
+    async def test_changed_wall_cancels_before_replacing(self):
+        await self.bot.place_quotes(self.state)
+        push_book(self.exchange,self.bot,self.state,
+                  {'bids':[['99.99','1'],['99.97','100']], 'asks':[['100.01','1'],['100.02','20']]})
+        worker=asyncio.create_task(self.bot.run_market(self.state))
+        try:
+            await until(lambda:'buy' not in self.state.main)
+            self.assertEqual(len(self.exchange.posts()),2)
+            push_book(self.exchange,self.bot,self.state,
+                      {'bids':[['99.99','1'],['99.97','100']], 'asks':[['100.01','1'],['100.02','20']]})
+            await until(lambda:'buy' in self.state.main)
+            self.assertEqual(self.state.tracked[self.state.main['buy']]['price'],D('99.96'))
+        finally:
+            self.bot.request_stop()
+            await worker
+
+    async def test_same_wall_quantity_change_keeps_queue_position(self):
+        await self.bot.place_quotes(self.state)
+        push_book(self.exchange,self.bot,self.state,
+                  {'bids':[['99.99','1'],['99.98','21']], 'asks':[['100.01','1'],['100.02','21']]})
+        worker=asyncio.create_task(self.bot.run_market(self.state))
+        try:
+            await asyncio.sleep(.05)
+            self.assertFalse(any(m=='DELETE' for m,p,b in self.exchange.calls))
+            self.assertEqual(len(self.exchange.posts()),2)
+        finally:
+            self.bot.request_stop()
+            await worker
+
+    def test_stale_server_timestamp_is_not_freshened_by_receipt(self):
+        from datetime import datetime, timezone
+        before = self.state.depth_seq
+        raw = copy.deepcopy(self.exchange.book)
+        raw['time'] = datetime.fromtimestamp(time.time()-10, timezone.utc).isoformat()
+        self.bot.set_book(self.state, raw)
+        self.assertEqual(self.state.depth_seq, before)
+
+    async def test_cancel_preserves_manual_and_legacy_orders(self):
+        manual=self.exchange.create_order('TEST','limit','buy','1','99.90',{'clientOrderId':'manual'})
+        legacy=self.exchange.create_order('TEST','limit','sell','1','100.10',{'clientOrderId':'po_h_old'})
+        await self.bot.place_quotes(self.state)
+        await self.bot.cancel_main(self.state)
+        self.assertFalse(self.state.main)
+        self.assertEqual(self.exchange.orders[manual['id']]['status'],'open')
+        self.assertEqual(self.exchange.orders[legacy['id']]['status'],'open')
+
+    async def test_partial_batch_failure_retains_success(self):
+        original=self.exchange._request
+        def request(method,path,params=None,body=None,private=True):
+            if method=='POST' and path=='/v1/perps/orders' and body['side']=='sell':
+                raise OndoAPIError('post only',code='post_only_has_match')
+            return original(method,path,params,body,private)
+        self.exchange._request=request
+        await self.bot.place_quotes(self.state)
+        self.assertEqual(set(self.state.main),{'buy'})
+        self.assertFalse(self.state.fatal)
+        self.assertEqual(len(self.state.tracked),1)
+
+    async def test_timeout_after_entire_batch_acceptance_only_queries(self):
+        original=self.exchange._request
+        count=0
+        def request(method,path,params=None,body=None,private=True):
+            nonlocal count
+            if method=='POST' and path.endswith('/batch'):
+                count+=1
+                original(method,path,params,body,private)
+                raise OndoAPIError('timeout after acceptance',uncertain=True)
+            return original(method,path,params,body,private)
+        self.exchange._request=request
+        await self.bot.place_quotes(self.state)
+        self.assertEqual(count,1)
+        self.assertEqual(len(self.state.main),2)
+        self.assertFalse(self.state.fatal)
+
+    async def test_inflight_batch_risk_trip_cleans_both_sides(self):
+        self.exchange.on_create=lambda:setattr(self.bot,'tripped','risk breach')
+        await self.bot.place_quotes(self.state)
+        self.assertFalse(self.state.main)
+        self.assertTrue(all(o['status']=='canceled' for o in self.exchange.orders.values()))
+
+    async def test_new_quote_amount_uses_market_setting(self):
+        self.state.order_size=D(250)
+        await self.bot.place_quotes(self.state)
+        self.assertTrue(all(D(249)<D(o['size'])*D(o['price'])<=D(250)
+                            for o in self.exchange.posts()))
+
+    async def test_cancel_failure_keeps_slot_and_blocks_replacement(self):
+        await self.bot.place_quotes(self.state)
+        with patch.object(self.exchange,'cancel_orders',side_effect=OndoAPIError('timeout',uncertain=True)):
+            await self.bot.cancel_main(self.state)
+        self.assertEqual(len(self.state.main),2)
+        self.assertTrue(self.state.problem)
+        push_book(self.exchange,self.bot,self.state)
+        await self.bot.place_quotes(self.state)
+        self.assertEqual(len(self.exchange.posts()),2)
+
+    async def test_reconnect_requires_new_generation_and_depth(self):
+        self.state.synced_generation=-1
+        await self.bot.place_quotes(self.state)
+        self.assertFalse(self.exchange.posts())
+        self.state.synced_generation=self.bot.generation
+        self.state.depth_at=0
+        await self.bot.place_quotes(self.state)
+        self.assertFalse(self.exchange.posts())
+
+    async def test_startup_refuses_legacy_main_in_unconfigured_market(self):
+        orders=[{'symbol':'OTHER', 'clientOrderId':'po_q_old'}]
+        with patch.object(self.exchange,'fetch_open_orders',return_value=orders):
+            with self.assertRaisesRegex(RuntimeError,'遗留主单'):
+                await self.bot.run()
+        self.assertFalse(self.exchange.posts())
+
+    async def test_disconnect_cancels_existing_orders(self):
+        await self.bot.place_quotes(self.state)
+        self.bot.ws_ready=False
+        worker=asyncio.create_task(self.bot.run_market(self.state))
+        try:
+            await until(lambda:not self.state.main)
+        finally:
+            self.bot.request_stop()
+            await worker
+
+    async def test_main_sync_waits_for_all_fill_history(self):
+        await self.bot.place_quotes(self.state)
+        entry=self.state.tracked[self.state.main['buy']]
+        self.exchange.fill(entry['id'],'1')
+        self.exchange.fill_lag=1
+        self.bot.observe_order(self.state,self.exchange.orders[entry['id']])
+        with self.assertRaisesRegex(OndoAPIError,'尚未齐全'):
+            await self.bot.sync_main(self.state,entry)
+        self.assertIn('buy',self.state.main)
+        await self.bot.cancel_main(self.state,('buy',))
+        self.assertNotIn('buy',self.state.main)
+        self.assertTrue(self.state.position_dirty)
+
+class MultiMarketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_limits_and_global_stop_cancel_all_three_markets(self):
+        clients={}
+        metadata={}
+        for name in ('AAA','BBB','CCC'):
+            client=FakeExchange()
+            self.addCleanup(client.close)
+            market={'id':name+'-USD.P','symbol':name+'/USDT:USDT','base':name,
+                    'precision':{'amount':'0.001','price':'0.01'}}
+            clients[market['symbol']]=client
+            metadata[market['symbol']]=market
+        for client in clients.values():
+            client._markets=metadata
+            client._markets_by_id={m['id']:m for m in metadata.values()}
+        risk=next(iter(clients.values()))
+        config=app.Config(tuple(app.MarketConfig(n,D(1000),D(5000)) for n in ('AAA','BBB','CCC')))
+        bot=app.PostOnlyBot(config,risk,clients)
+        bot.risk_ok=bot.ws_ready=True
+        for state in bot.states.values():
+            state.synced_generation=bot.generation
+            state.position_dirty=False
+            push_book(clients[state.symbol],bot,state)
+            self.assertIs(clients[state.symbol].limiter,bot.limiter)
+            await bot.place_quotes(state)
+        self.assertEqual(sum(len(c.orders) for c in clients.values()),6)
+        bot.tripped='global leverage breach'
+        workers=[asyncio.create_task(bot.run_market(s)) for s in bot.states.values()]
+        try:
+            await until(lambda:all(not s.main for s in bot.states.values()))
+            self.assertTrue(all(o['status']=='canceled' for c in clients.values() for o in c.orders.values()))
+        finally:
+            bot.request_stop()
+            await asyncio.gather(*workers)
+
