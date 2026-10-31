@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -179,7 +180,15 @@ class PostOnlyBot:
     def set_book(self, state, raw, depth=True):
         if raw.get('market', state.market['id']) != state.market['id']:
             raise ValueError('盘口市场不一致')
-        stamp = datetime.fromisoformat(raw['time'].replace('Z', '+00:00')).timestamp()
+        # RFC3339Nano 的小数秒可有 1~9 位；Python 3.10 仅接受 3/6 位。
+        timestamp = raw.get('time')
+        match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})',
+                             timestamp) if isinstance(timestamp, str) else None
+        if not match:
+            raise ValueError('盘口时间格式无效，需要带时区的 RFC3339 时间')
+        fraction = (match[2] or '').ljust(6, '0')[:6]
+        zone = '+00:00' if match[3] == 'Z' else match[3]
+        stamp = datetime.fromisoformat(f'{match[1]}.{fraction}{zone}').timestamp()
         if time.time() - stamp >= BOOK_SECONDS:
             return
         if stamp - time.time() > BOOK_SECONDS:
@@ -689,6 +698,8 @@ class PostOnlyBot:
                         ratio = leverage = "等待查询"
                         age = "无数据"
                     status = ("永久停挂" if self.tripped else
+                              "连接/同步中" if not self.ws_ready or any(
+                                  s.synced_generation != self.generation for s in self.states.values()) else
                               "冷却/恢复中" if self.recovering or self.limiter.cooling else
                               "查询异常/等待" if not self.risk_ok else "监控中")
                     print(
@@ -707,6 +718,7 @@ class PostOnlyBot:
 
     async def feed_loop(self):
         while not self.closing:
+            channel, market = 'stream', '-'
             self.ws_ready = False
             self.generation += 1
             for state in self.states.values():
@@ -726,12 +738,14 @@ class PostOnlyBot:
                             state.wake.set()
                         continue
                     channel = message.get("channel")
+                    market = '-'
                     data = message.get("data", [])
                     rows = data if isinstance(data, list) else [data]
                     for raw in rows:
                         state = self.by_market.get(raw.get("market"))
                         if state is None:
                             continue
+                        market = state.market['id']
                         if channel == "topOfBooksPerps":
                             self.set_book(state, raw, depth=False)
                         elif channel == 'depthBooksPerps':
@@ -778,7 +792,19 @@ class PostOnlyBot:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("实时连接中断，暂停主单并重连: %s", type(exc).__name__)
+                detail = str(exc)
+                for name in ('api_key_id', '_api_secret'):
+                    secret = getattr(self.risk_client, name, None)
+                    if secret:
+                        detail = detail.replace(secret, '<redacted>')
+                trace = exc.__traceback__
+                while trace and trace.tb_next:
+                    trace = trace.tb_next
+                source = (f'{Path(trace.tb_frame.f_code.co_filename).name}:{trace.tb_lineno}'
+                          if trace else '-')
+                log.warning('实时连接中断，暂停主单并重连: %s: %s | channel=%s market=%s source=%s',
+                            type(exc).__name__, detail.replace('\n', ' ').replace('\r', ' ')[:500],
+                            channel, market, source)
             finally:
                 self.ws_ready = False
                 self.need_reconcile = True
