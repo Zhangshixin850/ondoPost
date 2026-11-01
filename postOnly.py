@@ -1,4 +1,4 @@
-"""Ondo v2.0：稳定跟随外部大单；--check 只检查本地配置。"""
+"""Ondo v2.1：稳定跟随外部大单，支持边界同价；--check 只检查本地配置。"""
 
 import argparse
 import asyncio
@@ -108,6 +108,7 @@ class MarketState:
     anchors: dict = field(default_factory=lambda: {side: {
         'price': None, 'amount': Decimal(0), 'candidate': None, 'since': 0,
         'sample_seq': -1, 'reason': '', 'largest': None, 'largest_amount': Decimal(0),
+        'mode': 'behind', 'external_qty': Decimal(0), 'protection_min': Decimal(0),
     } for side in ('buy', 'sell')})
     sync_since: dict = field(default_factory=dict)
     blocked_sides: set = field(default_factory=set)
@@ -117,7 +118,7 @@ class MarketState:
     probe_orders_seq: int = 0
     probe_depth_seq: int = 0
     quiet_deadline: float = 0
-    stats: dict = field(default_factory=lambda: {'switch': 0, 'urgent': 0, 'sync': 0,
+    stats: dict = field(default_factory=lambda: {'switch': 0, 'mode_switch': 0, 'urgent': 0, 'sync': 0,
                                                 'probe': 0, 'closed': 0, 'hold_seconds': 0})
     stats_at: float = field(default_factory=time.monotonic)
     position: Decimal = Decimal('0')
@@ -255,6 +256,23 @@ class PostOnlyBot:
             state.book_time = stamp
             state.book_at = time.monotonic()
 
+    def wall_quote(self, state, side, wall, mode=None):
+        """默认退后一档；只有退后越过5bps边界时才允许同价。"""
+        if wall is None:
+            return None, mode, 'anchor_gone'
+        bid, ask = state.book
+        mid = (bid+ask)/2
+        direction = -1 if side == 'buy' else 1
+        behind = wall + direction*Decimal(state.market['precision']['price'])
+        if mode is None:
+            mode = 'same_level' if direction*(behind-mid)/mid*BPS > BAND else 'behind'
+        price = wall if mode == 'same_level' else behind
+        if price <= 0 or not (0 < direction*(price-mid)/mid*BPS <= BAND):
+            return None, mode, 'out_of_band'
+        if not (price < bid if side == 'buy' else price > ask):
+            return None, mode, 'self_best'
+        return price, mode, ''
+
     def quote_targets(self, state, update=True):
         """按同一深度快照选墙；保留仍有效的锚，最新 BBO 只作安全检查。"""
         targets = {'buy': None, 'sell': None}
@@ -278,9 +296,6 @@ class PostOnlyBot:
                 uncertain[index].add(price)
             elif remaining:
                 external[index][price] -= remaining
-        bid, ask = state.book
-        mid = (bid + ask) / 2
-        tick = Decimal(state.market['precision']['price'])
         now = time.monotonic()
         for index, side in enumerate(('buy', 'sell')):
             anchor = state.anchors[side]
@@ -290,15 +305,22 @@ class PostOnlyBot:
                        and 0 <= direction*(p-snapshot_mid)/snapshot_mid*BPS <= BAND}
             largest = max(amounts, key=lambda p: (amounts[p], abs(p-snapshot_mid))) if amounts else None
             reference = anchor['price']
-            reference_target = reference + direction*tick if reference is not None else None
-            reason = ''
+            reference_target, reference_mode, reason = self.wall_quote(state, side, reference, anchor['mode'])
+            minimum = Decimal(0)
+            reference_qty = external[index].get(reference, Decimal(0))
+            entry = state.tracked.get(state.main.get(side))
+            if update and entry and entry['anchor_price'] == reference:
+                entry['external_qty'] = reference_qty
             if reference is not None:
                 if reference not in amounts:
                     reason = 'sync_unverified' if reference in uncertain[index] else 'anchor_gone'
-                elif not (0 < direction*(reference_target-mid)/mid*BPS <= BAND):
-                    reason = 'out_of_band'
-                elif not (reference_target < bid if side == 'buy' else reference_target > ask):
-                    reason = 'self_best'
+                elif reference_mode == 'same_level':
+                    size = (entry['size']-entry['filled'] if entry and entry['price'] == reference
+                            and entry['quote_mode'] == 'same_level' else Decimal(
+                                self.clients[state.symbol].amount_to_precision(state.symbol, state.order_size/reference)))
+                    minimum = size/2
+                    if not reason and (size <= 0 or reference_qty < minimum):
+                        reason = 'protection_thin'
                 if reason:
                     reference = reference_target = None
             if update:
@@ -306,6 +328,7 @@ class PostOnlyBot:
                 anchor['largest'] = largest
                 anchor['largest_amount'] = amounts.get(largest, Decimal(0))
                 anchor['amount'] = amounts.get(reference, Decimal(0))
+                anchor.update(external_qty=reference_qty, protection_min=minimum)
             if uncertain[index]:
                 if not update:
                     continue
@@ -330,31 +353,46 @@ class PostOnlyBot:
                 if update:
                     anchor['price'] = anchor['candidate'] = None
                 continue
-            largest_target = largest + direction*tick if largest is not None else None
-            candidate_valid = (largest is not None and largest_target > 0
-                               and 0 < direction*(largest_target-mid)/mid*BPS <= BAND
-                               and (largest_target < bid if side == 'buy' else largest_target > ask))
-            switch = (candidate_valid and largest != reference and
-                      (reference is None or amounts[largest] >= amounts[reference]*self.config.wall_switch_ratio))
-            selected = reference
-            if switch and update:
+            largest_target, largest_mode, _ = self.wall_quote(state, side, largest)
+            if largest_target is not None and largest_mode == 'same_level':
+                size = Decimal(self.clients[state.symbol].amount_to_precision(state.symbol, state.order_size/largest))
+                if size <= 0 or external[index][largest] < size/2:
+                    largest_target = None
+            proposal = None
+            change_reason = ''
+            if (largest_target is not None and largest != reference
+                and (reference is None or amounts[largest] >= amounts[reference]*self.config.wall_switch_ratio)):
+                proposal = (largest, largest_target, largest_mode)
+                change_reason = 'wall_switch' if reference is not None else 'entry'
+            elif reference is not None and reference_mode == 'same_level':
+                behind, mode, _ = self.wall_quote(state, side, reference)
+                if behind is not None and mode == 'behind':
+                    proposal = (reference, behind, mode)
+                    change_reason = 'quote_mode_change'
+            selected, target, selected_mode = reference, reference_target, reference_mode
+            if proposal and update:
                 fresh_sample = state.depth_seq != anchor['sample_seq']
-                if anchor['candidate'] != largest:
-                    anchor.update(candidate=largest, since=now, sample_seq=state.depth_seq)
+                if anchor['candidate'] != proposal:
+                    anchor.update(candidate=proposal, since=now, sample_seq=state.depth_seq)
                     fresh_sample = False
                 confirmed = (self.config.wall_confirm_ms == 0 or
                              (fresh_sample and
                               (now-anchor['since'])*1000 >= self.config.wall_confirm_ms))
                 anchor['sample_seq'] = state.depth_seq
                 if confirmed:
-                    selected = largest
-                    anchor['reason'] = 'wall_switch' if reference is not None else 'entry'
-                    anchor.update(price=selected, amount=amounts[selected], candidate=None)
+                    selected, target, selected_mode = proposal
+                    anchor['reason'] = change_reason
+                    anchor.update(price=selected, mode=selected_mode, amount=amounts[selected], candidate=None)
             elif update:
                 anchor['candidate'] = None
                 anchor['price'] = reference
             if selected is not None:
-                targets[side] = selected + direction*tick
+                targets[side] = target
+                if update:
+                    if selected != reference or selected_mode != reference_mode:
+                        minimum = Decimal(self.clients[state.symbol].amount_to_precision(
+                            state.symbol, state.order_size/selected))/2 if selected_mode == 'same_level' else Decimal(0)
+                    anchor.update(external_qty=external[index][selected], protection_min=minimum)
         return targets
 
     async def verify_quiet_book(self, state):
@@ -502,7 +540,7 @@ class PostOnlyBot:
             entry["settled"] = True
             state.stats['closed'] += 1
             state.stats['hold_seconds'] += time.monotonic() - entry['created_at']
-            if entry.get('cancel_reason') != 'wall_switch':
+            if entry.get('cancel_reason') not in {'wall_switch', 'quote_mode_change'} or entry['filled']:
                 state.anchors[entry['side']].update(price=None, candidate=None)
             if state.main.get(entry["side"]) == entry["cid"]:
                 del state.main[entry["side"]]
@@ -523,15 +561,20 @@ class PostOnlyBot:
                 continue
             why = reason[entry['side']] if isinstance(reason, dict) else reason
             entry['cancel_reason'] = why
-            state.stats['switch' if why == 'wall_switch' else 'urgent'] += 1
+            counter = 'switch' if why == 'wall_switch' else 'mode_switch' if why == 'quote_mode_change' else 'urgent'
+            state.stats[counter] += 1
             anchor = state.anchors[entry['side']]
             mid = sum(state.book)/2 if state.book else entry['price']
-            next_price = (anchor['price'] + Decimal(state.market['precision']['price'])
-                          * (-1 if entry['side'] == 'buy' else 1)) if why == 'wall_switch' else None
+            next_price = (self.wall_quote(state, entry['side'], anchor['price'], anchor['mode'])[0]
+                          if why in {'wall_switch', 'quote_mode_change'} else None)
             log.info('%s 撤单 reason=%s side=%s anchor=%s next_anchor=%s max=%s/%s old=%s new=%s '
+                     'mode=%s next_mode=%s external_qty=%s protection_min=%s '
                      'distance=%.3fbps hold=%.3fs revision=%s', state.market['id'], why, entry['side'],
                      entry.get('anchor_price'), anchor['price'], anchor['largest'], anchor['largest_amount'],
-                     entry['price'], next_price, abs(entry['price']-mid)/mid*BPS,
+                     entry['price'], next_price, entry['quote_mode'], anchor['mode'],
+                     entry.get('external_qty', anchor['external_qty']),
+                     (entry['size']-entry['filled'])/2 if entry['quote_mode'] == 'same_level' else Decimal(0),
+                     abs(entry['price']-mid)/mid*BPS,
                      time.monotonic()-entry['created_at'], state.orders_seq)
         known = [e for e in entries if e['id'] and e['status'] not in TERMINAL]
         if known and not self.limiter.buckets['cancel'].cooling:
@@ -693,7 +736,8 @@ class PostOnlyBot:
                      'filled': Decimal(0), 'seen_size': Decimal(0), 'status': 'pending',
                      'settled': False, 'uncertain': True, 'fill_ids': set(),
                      'created_at': time.monotonic(), 'needs_lookup': False,
-                     'anchor_price': state.anchors[side]['price']}
+                     'anchor_price': state.anchors[side]['price'], 'quote_mode': state.anchors[side]['mode'],
+                     'external_qty': state.anchors[side]['external_qty']}
             state.main[side] = cid
             state.tracked[cid] = entry
             entries.append(entry)
@@ -724,7 +768,10 @@ class PostOnlyBot:
                 {'order': {'clientOrderId': e['cid']}, 'errorCode': exc.code} for e in entries]}
         for order in result['addedOrders']:
             self.observe_order(state, order['info'])
-            log.info('%s 主单 %s %s @ %s', state.market['id'], order['side'], order['amount'], order['price'])
+            anchor = state.anchors[order['side']]
+            log.info('%s 主单 %s %s @ %s mode=%s external_qty=%s protection_min=%s', state.market['id'],
+                     order['side'], order['amount'], order['price'], anchor['mode'],
+                     anchor['external_qty'], anchor['protection_min'])
         for failure in result['failedOrders']:
             cid = failure['order']['clientOrderId']
             entry = state.tracked[cid]
@@ -753,6 +800,7 @@ class PostOnlyBot:
                 state.fills.clear()
                 self.accept_fills(state, fills)
                 now = time.monotonic()
+                rest_verified = False
                 # 读请求独立运行；截止时间涵盖排队和网络，不延长持单宽限。
                 if state.probe is not None and state.probe.done():
                     try:
@@ -762,10 +810,7 @@ class PostOnlyBot:
                             and state.orders_seq == state.probe_orders_seq
                             and state.depth_seq == state.probe_depth_seq and not self.primary_paused(state)):
                             self.accept_probe(state, raw)
-                            targets = self.quote_targets(state)
-                            invalid = [s for s in state.main if targets[s] is None or s in state.blocked_sides]
-                            if invalid:
-                                await self.cancel_main(state, invalid, reason='book_unverified')
+                            rest_verified = True
                             state.quiet_deadline = 0
                         elif state.quiet_deadline and state.depth_seq == state.probe_depth_seq:
                             state.quiet_deadline = now
@@ -820,9 +865,11 @@ class PostOnlyBot:
                         # 即使公共深度尚未越过本人订单版本屏障，也要检查锚是否仍可验证。
                         targets = self.quote_targets(state)
                         changed = [side for side, cid in list(state.main.items())
-                                   if state.tracked[cid]['price'] != targets[side]]
+                                   if state.tracked[cid]['price'] != targets[side]
+                                   or (rest_verified and side in state.blocked_sides)]
                         if changed:
-                            reasons = {s: state.anchors[s]['reason'] or 'anchor_gone' for s in changed}
+                            reasons = {s: state.anchors[s]['reason'] or (
+                                'book_unverified' if s in state.blocked_sides else 'anchor_gone') for s in changed}
                             await self.cancel_main(state, tuple(changed), reason=reasons)
                         await self.place_quotes(state)
                 if state.position_dirty:
@@ -831,9 +878,10 @@ class PostOnlyBot:
                     stats = state.stats
                     ages = [now-e['created_at'] for e in state.tracked.values()]
                     mean = stats['hold_seconds']/stats['closed'] if stats['closed'] else 0
-                    log.info('%s 分钟统计 switch=%s urgent=%s sync=%s probe=%s '
+                    log.info('%s 分钟统计 switch=%s mode_switch=%s urgent=%s sync=%s probe=%s '
                              'closed_hold=%.2fs open_hold=%s', state.market['id'], stats['switch'],
-                             stats['urgent'], stats['sync'], stats['probe'], mean, [round(a, 2) for a in ages])
+                             stats['mode_switch'], stats['urgent'], stats['sync'], stats['probe'],
+                             mean, [round(a, 2) for a in ages])
                     for key in stats:
                         stats[key] = 0
                     state.stats_at = now
@@ -1142,7 +1190,7 @@ if __name__ == "__main__":
         if args.check:
             for i, market in enumerate(config.markets, 1):
                 print(f'{market.symbol}: orderSize={market.order_size} U/侧 | myLimit={market.position_limit} U')
-            print(f'v2.0 | ±5bps | 深度WS/不限档 | 退后1 tick | Post-only | 下单/撤单=2/2 RPS | '
+            print(f'v2.1 | ±5bps | 深度WS/不限档 | 退后1 tick/边界同价 | 同价保护≥50% | Post-only | 下单/撤单=2/2 RPS | '
                   f'MMR={config.mmr:.2%} | leverage={config.max_leverage}x | '
                   f'换墙优势={config.wall_switch_ratio}x | 确认={config.wall_confirm_ms}ms | 无反向单')
         else:

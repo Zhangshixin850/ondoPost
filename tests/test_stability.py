@@ -70,14 +70,15 @@ class AnchorTests(unittest.TestCase):
         self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.97'))
         self.assertEqual(self.snapshot('30')['buy'], D('99.95'))
 
-    def test_strongest_wall_outside_valid_quote_band_has_no_fallback(self):
+    def test_strongest_wall_uses_same_level_after_confirmation(self):
         book = copy.deepcopy(self.exchange.book)
         book['bids'].append(['99.95', '200'])
         push_book(self.exchange, self.bot, self.state, book)
         self.bot.quote_targets(self.state)
         self.clock[0] += .6
         push_book(self.exchange, self.bot, self.state, book)
-        self.assertIsNone(self.bot.quote_targets(self.state)['buy'])
+        self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.95'))
+        self.assertEqual(self.state.anchors['buy']['mode'], 'same_level')
 
     def test_selection_mid_comes_from_depth_safety_from_latest_bbo(self):
         self.enter()

@@ -85,10 +85,10 @@ class WallTests(unittest.IsolatedAsyncioTestCase):
         push_book(self.exchange, self.bot, self.state, raw)
         self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.95'))
 
-    def test_outside_boundary_pauses_without_second_choice(self):
+    def test_outside_boundary_quotes_same_level(self):
         raw = {'bids': [['99.99','1'], ['99.95','100']], 'asks': [['100.01','1'], ['100.04','100']]}
         push_book(self.exchange, self.bot, self.state, raw)
-        self.assertIsNone(self.bot.quote_targets(self.state)['buy'])
+        self.assertEqual(self.bot.quote_targets(self.state)['buy'], D('99.95'))
         self.assertEqual(self.bot.quote_targets(self.state)['sell'], D('100.05'))
 
     def test_coarse_tick_no_valid_quote(self):
