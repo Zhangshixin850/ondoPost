@@ -29,10 +29,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([m.order_size for m in c.markets], [D(1000), D(250)])
         self.assertEqual(c.markets[1].position_limit, D(1500))
         self.assertEqual((c.mmr, c.max_leverage), (D('.2'), D(5)))
+        self.assertEqual((c.wall_switch_ratio, c.wall_confirm_ms), (D('1.25'), D(500)))
+
+    def test_optional_stability_settings(self):
+        c = self.config(wallSwitchRatio='1.5', wallConfirmMs='0')
+        self.assertEqual((c.wall_switch_ratio, c.wall_confirm_ms), (D('1.5'), D(0)))
 
     def test_invalid_values_and_symbols(self):
         for settings in ({'symbol1': ''}, {'symbol2': 'test'}, {'orderSize1': ''},
-                         {'orderSize1': 'NaN'}, {'myLimit1': '-1'}, {'MMR': '0'}, {'leverage': 'Infinity'}):
+                         {'orderSize1': 'NaN'}, {'myLimit1': '-1'}, {'MMR': '0'}, {'leverage': 'Infinity'},
+                         {'wallSwitchRatio': '.9'}, {'wallSwitchRatio': 'NaN'}, {'wallConfirmMs': '-1'}):
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 self.config(**settings)
 
@@ -90,10 +96,13 @@ class WallTests(unittest.IsolatedAsyncioTestCase):
         push_book(self.exchange, self.bot, self.state, raw)
         self.assertEqual(self.bot.quote_targets(self.state), {'buy':None,'sell':None})
 
-    def test_bad_self_deduction_pauses(self):
+    def test_bad_self_deduction_blocks_only_affected_side(self):
         self.state.own_orders['manual'] = {'side':'buy','price':'99.98','size':'100','filledSize':'0','status':'open'}
-        with self.assertRaisesRegex(ValueError, '不同步'):
-            self.bot.quote_targets(self.state)
+        targets = self.bot.quote_targets(self.state)
+        self.assertIsNone(targets['buy'])
+        self.assertEqual(targets['sell'], D('100.03'))
+        self.assertEqual(self.state.blocked_sides, {'buy'})
+        self.assertTrue(self.bot.need_reconcile)
 
     def test_snapshots_replace_reject_old_and_grouped(self):
         raw = push_book(self.exchange, self.bot, self.state)
@@ -348,7 +357,8 @@ class MultiMarketTests(unittest.IsolatedAsyncioTestCase):
             client._markets=metadata
             client._markets_by_id={m['id']:m for m in metadata.values()}
         risk=next(iter(clients.values()))
-        config=app.Config(tuple(app.MarketConfig(n,D(1000),D(5000)) for n in ('AAA','BBB','CCC')))
+        config=app.Config(tuple(app.MarketConfig(n,D(1000),D(5000)) for n in ('AAA','BBB','CCC')),
+                          wall_confirm_ms=D(0))
         bot=app.PostOnlyBot(config,risk,clients)
         bot.risk_ok=bot.ws_ready=True
         for state in bot.states.values():

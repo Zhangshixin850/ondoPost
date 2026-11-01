@@ -66,6 +66,18 @@ class FeedDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         logging.disable(logging.NOTSET)
         self.addCleanup(logging.disable, disabled)
 
+    async def test_pong_refreshes_liveness_without_advancing_depth(self):
+        sequence = self.state.depth_seq
+        async def stream(markets):
+            yield {'type': 'ready'}
+            self.bot.ws_alive_at = 0
+            yield {'type': 'pong'}
+            self.assertGreater(self.bot.ws_alive_at, 0)
+            self.assertEqual(self.state.depth_seq, sequence)
+            self.bot.request_stop()
+        with patch.object(self.exchange, 'stream', stream):
+            await self.bot.feed_loop()
+
     async def test_bad_book_reports_channel_market_reason_and_location(self):
         async def stream(markets):
             yield {'type': 'ready'}

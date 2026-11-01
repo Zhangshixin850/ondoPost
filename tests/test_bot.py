@@ -172,7 +172,7 @@ def push_book(exchange, bot, state, book=None, own=True):
 
 def fixture():
     exchange = FakeExchange()
-    config = app.Config((app.MarketConfig('TEST', D('1000'), D('5000')),))
+    config = app.Config((app.MarketConfig('TEST', D('1000'), D('5000')),), wall_confirm_ms=D(0))
     bot = app.PostOnlyBot(config, exchange, {"TEST/USDT:USDT": exchange})
     state = next(iter(bot.states.values()))
     bot.risk_ok = bot.ws_ready = True

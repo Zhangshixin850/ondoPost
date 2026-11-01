@@ -175,6 +175,7 @@ class OndoExchange:
         self.timeout = timeout
         self._requests = requests
         self._session = requests.Session()
+        self._depth_session = requests.Session()
         self._markets = {}
         self._markets_by_id = {}
         self._closed = False
@@ -192,11 +193,11 @@ class OndoExchange:
         return cls(api_key_id, api_secret, api_url, timeout, limiter=limiter)
 
     @contextmanager
-    def request_context(self, priority=2, valid=None, post_valid=None):
+    def request_context(self, priority=2, valid=None, post_valid=None, deadline=None):
         if not hasattr(self, "_request_local"):
             self._request_local = threading.local()
-        previous = getattr(self._request_local, "settings", (2, None, None))
-        self._request_local.settings = (priority, valid, post_valid)
+        previous = getattr(self._request_local, "settings", (2, None, None, None))
+        self._request_local.settings = (priority, valid, post_valid, deadline)
         try:
             yield
         finally:
@@ -207,11 +208,12 @@ class OndoExchange:
             raise RuntimeError("Ondo client is closed")
 
         method = method.upper()
-        priority, valid, post_valid = getattr(self._request_local, "settings", (2, None, None))
+        priority, valid, post_valid, deadline = getattr(self._request_local, "settings", (2, None, None, None))
         if method == "GET" and "/orders/client:" in path:
             priority = min(priority, 1)
         def allowed():
             return ((valid is None or valid())
+                    and (deadline is None or time.monotonic() < deadline)
                     and (method != "POST" or post_valid is None or post_valid()))
         # 等待额度后才构造和签名，避免时间戳在队列中失效。
         limiter = (self.limiter.bucket(method, path)
@@ -225,7 +227,8 @@ class OndoExchange:
             data=body_text.encode("utf-8") if body is not None else None,
             headers={"Content-Type": "application/json"},
         )
-        prepared = self._session.prepare_request(request)
+        session = self._depth_session if path == '/v1/perps/depth' else self._session
+        prepared = session.prepare_request(request)
         if private:
             timestamp = str(int(time.time() * 1000))
             # 使用最终发送的 URI 和正文，避免编码或空格导致签名不一致。
@@ -239,12 +242,15 @@ class OndoExchange:
                 "ONDO-SIGN": signature,
             })
 
-        settings = self._session.merge_environment_settings(
+        settings = session.merge_environment_settings(
             prepared.url, {}, None, None, None
         )
+        timeout = self.timeout if deadline is None else min(self.timeout, deadline - time.monotonic())
+        if timeout <= 0 or not allowed():
+            raise OndoRequestSkipped('Request deadline or validity expired before sending')
         try:
-            response = self._session.send(
-                prepared, timeout=self.timeout, allow_redirects=False, **settings
+            response = session.send(
+                prepared, timeout=timeout, allow_redirects=False, **settings
             )
         except self._requests.RequestException as exc:
             raise OndoAPIError(
@@ -773,6 +779,7 @@ class OndoExchange:
                     raise OndoAPIError("WebSocket rejected login or subscription")
                 if message.get("type") == "pong":
                     waiting_pong = None
+                    yield {"type": "pong"}
                 elif message.get("type") == "loggedIn" and not logged_in:
                     logged_in = True
                     for channel in sorted(channels):
@@ -806,4 +813,5 @@ class OndoExchange:
     def close(self):
         if not self._closed:
             self._session.close()
+            self._depth_session.close()
             self._closed = True

@@ -1,4 +1,4 @@
-"""Ondo v2.0：跟随最大外部价位；--check 只检查本地配置。"""
+"""Ondo v2.0：稳定跟随外部大单；--check 只检查本地配置。"""
 
 import argparse
 import asyncio
@@ -23,6 +23,7 @@ BAND = Decimal('5')
 RISK_SECONDS = 10
 RECONCILE_SECONDS = 30
 BOOK_SECONDS = 3
+VERIFY_SECONDS = 1
 MAIN_PREFIX = 'po_q_'
 TERMINAL = {'filled', 'canceled'}
 log = logging.getLogger('postOnly')
@@ -40,6 +41,8 @@ class Config:
     markets: tuple
     mmr: Decimal = Decimal('0.2')
     max_leverage: Decimal = Decimal('5')
+    wall_switch_ratio: Decimal = Decimal('1.25')
+    wall_confirm_ms: Decimal = Decimal('500')
 
     @property
     def symbols(self):
@@ -60,16 +63,20 @@ class Config:
         if not markets or len({m[0] for m in markets}) != len(markets):
             raise ValueError('至少填写一个 symbol，非空市场不能重复')
         values.update(MMR=os.getenv('MMR', '0.2').strip(), leverage=os.getenv('leverage', '5').strip())
+        values.update(wallSwitchRatio=os.getenv('wallSwitchRatio', '1.25').strip(),
+                      wallConfirmMs=os.getenv('wallConfirmMs', '500').strip())
         for name, raw in values.items():
             try:
                 number = Decimal(raw)
             except InvalidOperation:
                 raise ValueError(f'{name} 必须是有效数字') from None
-            if not number.is_finite() or number <= 0:
+            if not number.is_finite() or number < 0 or (number == 0 and name != 'wallConfirmMs'):
                 raise ValueError(f'{name} 必须是有限正数')
             values[name] = number
+        if values['wallSwitchRatio'] < 1:
+            raise ValueError('wallSwitchRatio 必须大于等于1')
         return cls(tuple(MarketConfig(s, values[o], values[l]) for s, o, l in markets),
-                   values['MMR'], values['leverage'])
+                   values['MMR'], values['leverage'], values['wallSwitchRatio'], values['wallConfirmMs'])
 
 
 @dataclass
@@ -96,6 +103,23 @@ class MarketState:
     depth_time: float = 0
     depth_seq: int = 0
     depth_barrier: int = -1
+    depth_mid: Decimal = Decimal('0')
+    ws_received_at: float = 0
+    anchors: dict = field(default_factory=lambda: {side: {
+        'price': None, 'amount': Decimal(0), 'candidate': None, 'since': 0,
+        'sample_seq': -1, 'reason': '', 'largest': None, 'largest_amount': Decimal(0),
+    } for side in ('buy', 'sell')})
+    sync_since: dict = field(default_factory=dict)
+    blocked_sides: set = field(default_factory=set)
+    probe: object = None
+    probe_deadline: float = 0
+    probe_generation: int = 0
+    probe_orders_seq: int = 0
+    probe_depth_seq: int = 0
+    quiet_deadline: float = 0
+    stats: dict = field(default_factory=lambda: {'switch': 0, 'urgent': 0, 'sync': 0,
+                                                'probe': 0, 'closed': 0, 'hold_seconds': 0})
+    stats_at: float = field(default_factory=time.monotonic)
     position: Decimal = Decimal('0')
     mark: Decimal = Decimal('0')
     position_dirty: bool = True
@@ -135,6 +159,7 @@ class PostOnlyBot:
         self.reconcile_lock = asyncio.Lock()
         self.last_risk = None
         self.risk_at = 0
+        self.ws_alive_at = 0
 
     def primary_paused(self, state):
         return (self.closing or bool(self.tripped) or not self.risk_ok or self.recovering
@@ -147,12 +172,12 @@ class PostOnlyBot:
                 and not state.partial and not state.fills and not state.updates
                 and not any(e['id'] and e['status'] == 'pending' for e in state.tracked.values()))
 
-    async def rest(self, client, method, *args, priority=2, valid=None, post_valid=None):
+    async def rest(self, client, method, *args, priority=2, valid=None, post_valid=None, deadline=None):
         def allowed():
             return ((not self.closing or time.monotonic() < self.shutdown_deadline)
                     and (valid is None or valid()))
         def execute():
-            with client.request_context(priority, allowed, post_valid):
+            with client.request_context(priority, allowed, post_valid, deadline):
                 return getattr(client, method)(*args)
         try:
             return await asyncio.to_thread(execute)
@@ -177,7 +202,7 @@ class PostOnlyBot:
             for state in self.states.values():
                 state.wake.set()
 
-    def set_book(self, state, raw, depth=True):
+    def set_book(self, state, raw, depth=True, rest=False):
         if raw.get('market', state.market['id']) != state.market['id']:
             raise ValueError('盘口市场不一致')
         # RFC3339Nano 的小数秒可有 1~9 位；Python 3.10 仅接受 3/6 位。
@@ -189,11 +214,15 @@ class PostOnlyBot:
         fraction = (match[2] or '').ljust(6, '0')[:6]
         zone = '+00:00' if match[3] == 'Z' else match[3]
         stamp = datetime.fromisoformat(f'{match[1]}.{fraction}{zone}').timestamp()
-        if time.time() - stamp >= BOOK_SECONDS:
+        if not rest and time.time() - stamp >= BOOK_SECONDS:
             return
         if stamp - time.time() > BOOK_SECONDS:
             raise ValueError('盘口时间超前，请检查系统时钟')
-        if stamp <= (state.depth_time if depth else state.book_time):
+        previous_time = state.depth_time if depth else state.book_time
+        if stamp < previous_time:
+            return
+        if not rest and stamp == previous_time:
+            state.ws_received_at = time.monotonic()
             return
         tick = Decimal(state.market['precision']['price'])
         if depth and raw.get('depthLevels') is not None and Decimal(raw['depthLevels']) != tick:
@@ -211,21 +240,29 @@ class PostOnlyBot:
             levels.append(book)
         if not all(levels) or max(levels[0]) >= min(levels[1]):
             raise ValueError('盘口缺失或交叉')
+        if rest and stamp <= state.book_time and state.book and state.book != (max(levels[0]), min(levels[1])):
+            raise ValueError('REST 与更新的买一卖一不一致')
         if depth:
             state.depth = tuple(levels)
+            state.depth_mid = (max(levels[0]) + min(levels[1])) / 2
             state.depth_time = stamp
             state.depth_at = time.monotonic()
             state.depth_seq += 1
+        if not rest:
+            state.ws_received_at = time.monotonic()
         if stamp >= state.book_time:
             state.book = (max(levels[0]), min(levels[1]))
             state.book_time = stamp
             state.book_at = time.monotonic()
 
-    def quote_targets(self, state):
+    def quote_targets(self, state, update=True):
+        """按同一深度快照选墙；保留仍有效的锚，最新 BBO 只作安全检查。"""
         targets = {'buy': None, 'sell': None}
         if not state.depth or not state.book or time.monotonic() - state.depth_at >= BOOK_SECONDS:
             return targets
         external = [dict(levels) for levels in state.depth]
+        uncertain = [set(), set()]
+        snapshot_mid = state.depth_mid
         for order in list(state.own_orders.values()):
             # 未触发的条件单尚未进入盘口，不能从公开深度中扣除。
             if order['status'] != 'open':
@@ -233,25 +270,126 @@ class PostOnlyBot:
             index = 0 if order['side'] == 'buy' else 1
             remaining = Decimal(order['size']) - Decimal(order['filledSize'])
             price = Decimal(order['price'])
+            if not remaining.is_finite() or remaining < 0 or not price.is_finite():
+                raise ValueError('本人订单数量或价格无效')
+            if abs(price - snapshot_mid) / snapshot_mid * BPS > BAND:
+                continue
             if remaining > external[index].get(price, Decimal(0)):
-                raise ValueError('本人订单与深度快照不同步，等待对账')
-            if remaining:
+                uncertain[index].add(price)
+            elif remaining:
                 external[index][price] -= remaining
         bid, ask = state.book
         mid = (bid + ask) / 2
         tick = Decimal(state.market['precision']['price'])
+        now = time.monotonic()
         for index, side in enumerate(('buy', 'sell')):
+            anchor = state.anchors[side]
             direction = -1 if side == 'buy' else 1
-            eligible = [(p * q, abs(p - mid), p) for p, q in external[index].items()
-                        if q > 0 and 0 <= direction * (p - mid) / mid * BPS <= BAND]
-            if not eligible:
+            amounts = {p: p*q for p, q in external[index].items() if q > 0
+                       and p not in uncertain[index]
+                       and 0 <= direction*(p-snapshot_mid)/snapshot_mid*BPS <= BAND}
+            largest = max(amounts, key=lambda p: (amounts[p], abs(p-snapshot_mid))) if amounts else None
+            reference = anchor['price']
+            reference_target = reference + direction*tick if reference is not None else None
+            reason = ''
+            if reference is not None:
+                if reference not in amounts:
+                    reason = 'sync_unverified' if reference in uncertain[index] else 'anchor_gone'
+                elif not (0 < direction*(reference_target-mid)/mid*BPS <= BAND):
+                    reason = 'out_of_band'
+                elif not (reference_target < bid if side == 'buy' else reference_target > ask):
+                    reason = 'self_best'
+                if reason:
+                    reference = reference_target = None
+            if update:
+                anchor['reason'] = reason
+                anchor['largest'] = largest
+                anchor['largest_amount'] = amounts.get(largest, Decimal(0))
+                anchor['amount'] = amounts.get(reference, Decimal(0))
+            if uncertain[index]:
+                if not update:
+                    continue
+                if side not in state.sync_since:
+                    state.sync_since[side] = now
+                    state.stats['sync'] += 1
+                    self.need_reconcile = True
+                    self.account_wake.set()
+                state.blocked_sides.add(side)
+                anchor['candidate'] = None
+                since = state.sync_since.get(side, now)
+                if reference is not None and now-since < VERIFY_SECONDS:
+                    targets[side] = reference_target
+                else:
+                    anchor['reason'] = 'sync_unverified'
                 continue
-            wall = max(eligible)[2]
-            price = wall + direction * tick
-            distance = direction * (price - mid) / mid * BPS
-            if price > 0 and 0 < distance <= BAND and (price < bid if side == 'buy' else price > ask):
-                targets[side] = price
+            if update:
+                state.sync_since.pop(side, None)
+                state.blocked_sides.discard(side)
+            if reference is None and side in state.main:
+                # 原锚失效：先撤单，下次入场重新确认，不在这一帧直接追另一档。
+                if update:
+                    anchor['price'] = anchor['candidate'] = None
+                continue
+            largest_target = largest + direction*tick if largest is not None else None
+            candidate_valid = (largest is not None and largest_target > 0
+                               and 0 < direction*(largest_target-mid)/mid*BPS <= BAND
+                               and (largest_target < bid if side == 'buy' else largest_target > ask))
+            switch = (candidate_valid and largest != reference and
+                      (reference is None or amounts[largest] >= amounts[reference]*self.config.wall_switch_ratio))
+            selected = reference
+            if switch and update:
+                fresh_sample = state.depth_seq != anchor['sample_seq']
+                if anchor['candidate'] != largest:
+                    anchor.update(candidate=largest, since=now, sample_seq=state.depth_seq)
+                    fresh_sample = False
+                confirmed = (self.config.wall_confirm_ms == 0 or
+                             (fresh_sample and
+                              (now-anchor['since'])*1000 >= self.config.wall_confirm_ms))
+                anchor['sample_seq'] = state.depth_seq
+                if confirmed:
+                    selected = largest
+                    anchor['reason'] = 'wall_switch' if reference is not None else 'entry'
+                    anchor.update(price=selected, amount=amounts[selected], candidate=None)
+            elif update:
+                anchor['candidate'] = None
+                anchor['price'] = reference
+            if selected is not None:
+                targets[side] = selected + direction*tick
         return targets
+
+    async def verify_quiet_book(self, state):
+        """只读校验；结果由市场循环按截止时间、连接代次和账本版本接收。"""
+        generation, revision, sequence = state.probe_generation, state.probe_orders_seq, state.probe_depth_seq
+        result = await self.rest(self.clients[state.symbol], 'fetch_order_book', state.symbol, 100,
+                                 priority=1, deadline=state.probe_deadline,
+                                 valid=lambda: (not self.primary_paused(state) and self.generation == generation
+                                                and state.orders_seq == revision and state.depth_seq == sequence
+                                                and not state.updates and not state.fills))
+        return result['info']
+
+    def accept_probe(self, state, raw):
+        bids = [Decimal(p) for p, q in raw['bids'] if Decimal(q) > 0]
+        asks = [Decimal(p) for p, q in raw['asks'] if Decimal(q) > 0]
+        if not bids or not asks:
+            raise ValueError('REST 盘口为空')
+        mid = (max(bids)+min(asks))/2
+        if ((len(raw['bids']) >= 100 and (mid-min(bids))/mid*BPS < BAND)
+            or (len(raw['asks']) >= 100 and (max(asks)-mid)/mid*BPS < BAND)):
+            raise ValueError('REST 100档未覆盖完整5bps')
+        previous = state.depth_seq
+        self.set_book(state, raw, rest=True)
+        if state.depth_seq == previous:
+            raise ValueError('REST 快照比现有深度更旧')
+        if state.book != (max(bids), min(asks)):
+            raise ValueError('REST 与更新的买一卖一不一致')
+        state.book_at = time.monotonic()
+
+    @staticmethod
+    def order_signature(raw):
+        # 服务端更新时间等元数据变化不代表本人的盘口数量变化。
+        if raw is None:
+            return None
+        return (raw['side'], *(Decimal(raw[k]) for k in ('price', 'size', 'filledSize')), raw['status'])
 
     def observe_order(self, state, raw):
         oid = str(raw['orderId'])
@@ -260,7 +398,7 @@ class PostOnlyBot:
             state.own_orders.pop(oid, None)
         else:
             state.own_orders[oid] = dict(raw)
-        if previous != state.own_orders.get(oid):
+        if self.order_signature(previous) != self.order_signature(state.own_orders.get(oid)):
             state.orders_seq += 1
             state.depth_barrier = state.depth_seq
         cid = raw.get("clientOrderId") or state.by_id.get(str(raw["orderId"]))
@@ -362,6 +500,10 @@ class PostOnlyBot:
             if entry["seen_size"] != entry["filled"]:
                 raise OndoAPIError(f"终态成交数量尚未对齐: {entry['cid']}")
             entry["settled"] = True
+            state.stats['closed'] += 1
+            state.stats['hold_seconds'] += time.monotonic() - entry['created_at']
+            if entry.get('cancel_reason') != 'wall_switch':
+                state.anchors[entry['side']].update(price=None, candidate=None)
             if state.main.get(entry["side"]) == entry["cid"]:
                 del state.main[entry["side"]]
                 state.partial.discard(entry["side"])
@@ -373,9 +515,24 @@ class PostOnlyBot:
         elif cancel:
             raise OndoAPIError(f"撤单尚未确认: {entry['cid']}")
 
-    async def cancel_main(self, state, sides=('buy', 'sell'), priority=0):
+    async def cancel_main(self, state, sides=('buy', 'sell'), priority=0, reason='risk'):
         entries = [state.tracked[state.main[s]] for s in sides if s in state.main]
-        entries = [e for e in entries if time.monotonic() >= e.get('retry_at', 0)]
+        entries = [e for e in entries if not e.get('cancel_reason') or time.monotonic() >= e.get('retry_at', 0)]
+        for entry in entries:
+            if entry.get('cancel_reason'):
+                continue
+            why = reason[entry['side']] if isinstance(reason, dict) else reason
+            entry['cancel_reason'] = why
+            state.stats['switch' if why == 'wall_switch' else 'urgent'] += 1
+            anchor = state.anchors[entry['side']]
+            mid = sum(state.book)/2 if state.book else entry['price']
+            next_price = (anchor['price'] + Decimal(state.market['precision']['price'])
+                          * (-1 if entry['side'] == 'buy' else 1)) if why == 'wall_switch' else None
+            log.info('%s 撤单 reason=%s side=%s anchor=%s next_anchor=%s max=%s/%s old=%s new=%s '
+                     'distance=%.3fbps hold=%.3fs revision=%s', state.market['id'], why, entry['side'],
+                     entry.get('anchor_price'), anchor['price'], anchor['largest'], anchor['largest_amount'],
+                     entry['price'], next_price, abs(entry['price']-mid)/mid*BPS,
+                     time.monotonic()-entry['created_at'], state.orders_seq)
         known = [e for e in entries if e['id'] and e['status'] not in TERMINAL]
         if known and not self.limiter.buckets['cancel'].cooling:
             try:
@@ -457,10 +614,12 @@ class PostOnlyBot:
                 if current.orders_seq != versions[current.symbol]:
                     changed = True
                     continue
-                if current.own_orders != own[current.symbol]:
+                before = {oid: self.order_signature(raw) for oid, raw in current.own_orders.items()}
+                after = {oid: self.order_signature(raw) for oid, raw in own[current.symbol].items()}
+                if before != after:
                     current.depth_barrier = current.depth_seq
+                    current.orders_seq += 1
                 current.own_orders = own[current.symbol]
-                current.orders_seq += 1
                 for raw in list(current.own_orders.values()):
                     self.observe_order(current, raw)
                 for entry in current.tracked.values():
@@ -517,13 +676,14 @@ class PostOnlyBot:
 
     async def place_quotes(self, state, sides=('buy', 'sell')):
         if (not self.quote_allowed(state) or state.depth_seq <= state.depth_barrier
-            or time.monotonic() - state.book_at >= BOOK_SECONDS):
+            or state.quiet_deadline or time.monotonic() - state.book_at >= BOOK_SECONDS):
             return
         targets = self.quote_targets(state)
         entries = []
         for side in sides:
             price = targets[side]
-            if side in state.main or price is None or time.monotonic() < state.retry_at.get(side, 0):
+            if (side in state.main or side in state.blocked_sides or price is None
+                or time.monotonic() < state.retry_at.get(side, 0)):
                 continue
             size = Decimal(self.clients[state.symbol].amount_to_precision(state.symbol, state.order_size / price))
             if size <= 0:
@@ -532,7 +692,8 @@ class PostOnlyBot:
             entry = {'cid': cid, 'id': None, 'side': side, 'price': price, 'size': size,
                      'filled': Decimal(0), 'seen_size': Decimal(0), 'status': 'pending',
                      'settled': False, 'uncertain': True, 'fill_ids': set(),
-                     'created_at': time.monotonic(), 'needs_lookup': False}
+                     'created_at': time.monotonic(), 'needs_lookup': False,
+                     'anchor_price': state.anchors[side]['price']}
             state.main[side] = cid
             state.tracked[cid] = entry
             entries.append(entry)
@@ -541,10 +702,11 @@ class PostOnlyBot:
         def still_valid():
             try:
                 if (not self.quote_allowed(state) or state.depth_seq <= state.depth_barrier
-                    or time.monotonic() - state.book_at >= BOOK_SECONDS):
+                    or state.quiet_deadline or time.monotonic() - state.book_at >= BOOK_SECONDS):
                     return False
-                latest = self.quote_targets(state)
-                return all(latest[e['side']] == e['price'] for e in entries)
+                latest = self.quote_targets(state, update=False)
+                return all(e['side'] not in state.blocked_sides and latest[e['side']] == e['price']
+                           for e in entries)
             except (ValueError, KeyError, InvalidOperation):
                 return False
         try:
@@ -573,6 +735,7 @@ class PostOnlyBot:
             else:
                 state.main.pop(entry['side'], None)
                 state.tracked.pop(cid, None)
+                state.anchors[entry['side']].update(price=None, candidate=None)
                 state.retry_at[entry['side']] = time.monotonic() + 1
                 if failure.get('errorCode') not in {'quote_expired', 'post_only_has_match'}:
                     log.warning('%s 主单拒绝: %s', state.market['id'], failure.get('errorCode'))
@@ -589,31 +752,91 @@ class PostOnlyBot:
                 fills = list(state.fills)
                 state.fills.clear()
                 self.accept_fills(state, fills)
-                stale = time.monotonic() - state.depth_at >= BOOK_SECONDS
-                if self.primary_paused(state) or stale:
-                    await self.cancel_main(state)
+                now = time.monotonic()
+                # 读请求独立运行；截止时间涵盖排队和网络，不延长持单宽限。
+                if state.probe is not None and state.probe.done():
+                    try:
+                        raw = state.probe.result()
+                        if (state.quiet_deadline and now < state.probe_deadline
+                            and self.generation == state.probe_generation
+                            and state.orders_seq == state.probe_orders_seq
+                            and state.depth_seq == state.probe_depth_seq and not self.primary_paused(state)):
+                            self.accept_probe(state, raw)
+                            targets = self.quote_targets(state)
+                            invalid = [s for s in state.main if targets[s] is None or s in state.blocked_sides]
+                            if invalid:
+                                await self.cancel_main(state, invalid, reason='book_unverified')
+                            state.quiet_deadline = 0
+                        elif state.quiet_deadline and state.depth_seq == state.probe_depth_seq:
+                            state.quiet_deadline = now
+                    except (OndoAPIError, OndoRequestSkipped, ValueError, KeyError, TypeError, InvalidOperation) as exc:
+                        if state.quiet_deadline:
+                            state.quiet_deadline = now
+                            log.warning('%s 静默盘口核验失败: %s', state.market['id'], exc)
+                    finally:
+                        state.probe = None
+                stale = now - state.depth_at >= BOOK_SECONDS
+                if not stale:
+                    state.quiet_deadline = 0
+                if self.primary_paused(state):
+                    await self.cancel_main(state, reason='risk')
                 else:
                     if state.partial:
-                        await self.cancel_main(state, tuple(state.partial))
+                        await self.cancel_main(state, tuple(state.partial), reason='filled')
                     for entry in list(state.tracked.values()):
                         if ((entry['status'] in TERMINAL or entry.get('needs_lookup'))
                             and time.monotonic() >= entry.get('retry_at', 0)):
                             await self.sync_main(state, entry)
-                    # 即使等待新深度，也不能让自己的主单停留在买一或卖一。
-                    best = [side for side, cid in list(state.main.items()) if state.book and
-                            (state.tracked[cid]['price'] >= state.book[0] if side == 'buy'
-                             else state.tracked[cid]['price'] <= state.book[1])]
-                    if best:
-                        await self.cancel_main(state, tuple(best))
-                    if self.quote_allowed(state) and state.depth_seq > state.depth_barrier:
+                    # 最新 BBO 的安全规则不等待深度同步或换墙确认。
+                    unsafe = {}
+                    for side, cid in list(state.main.items()):
+                        if not state.book:
+                            continue
+                        price = state.tracked[cid]['price']
+                        mid = sum(state.book)/2
+                        if (price >= state.book[0] if side == 'buy' else price <= state.book[1]):
+                            unsafe[side] = 'self_best'
+                        elif abs(price-mid)/mid*BPS > BAND:
+                            unsafe[side] = 'out_of_band'
+                    if unsafe:
+                        await self.cancel_main(state, tuple(unsafe), reason=unsafe)
+                    if stale:
+                        if not state.quiet_deadline:
+                            state.quiet_deadline = now + VERIFY_SECONDS
+                            if (now-self.ws_alive_at < 15 and state.probe is None
+                                and state.synced_generation == self.generation):
+                                state.probe_deadline = state.quiet_deadline
+                                state.probe_generation = self.generation
+                                state.probe_orders_seq = state.orders_seq
+                                state.probe_depth_seq = state.depth_seq
+                                state.stats['probe'] += 1
+                                state.probe = asyncio.create_task(self.verify_quiet_book(state))
+                                state.probe.add_done_callback(lambda _, event=state.wake: event.set())
+                            else:
+                                state.quiet_deadline = now
+                        if now >= state.quiet_deadline:
+                            await self.cancel_main(state, reason='book_unverified')
+                    else:
+                        # 即使公共深度尚未越过本人订单版本屏障，也要检查锚是否仍可验证。
                         targets = self.quote_targets(state)
                         changed = [side for side, cid in list(state.main.items())
                                    if state.tracked[cid]['price'] != targets[side]]
                         if changed:
-                            await self.cancel_main(state, tuple(changed))
+                            reasons = {s: state.anchors[s]['reason'] or 'anchor_gone' for s in changed}
+                            await self.cancel_main(state, tuple(changed), reason=reasons)
                         await self.place_quotes(state)
                 if state.position_dirty:
                     self.account_wake.set()
+                if now-state.stats_at >= 60:
+                    stats = state.stats
+                    ages = [now-e['created_at'] for e in state.tracked.values()]
+                    mean = stats['hold_seconds']/stats['closed'] if stats['closed'] else 0
+                    log.info('%s 分钟统计 switch=%s urgent=%s sync=%s probe=%s '
+                             'closed_hold=%.2fs open_hold=%s', state.market['id'], stats['switch'],
+                             stats['urgent'], stats['sync'], stats['probe'], mean, [round(a, 2) for a in ages])
+                    for key in stats:
+                        stats[key] = 0
+                    state.stats_at = now
             except OndoRequestSkipped:
                 pass
             except OndoFatalError as exc:
@@ -639,9 +862,17 @@ class PostOnlyBot:
                     log.critical('%s 退出清理未完成: %s', state.market['id'], list(state.main.values()))
                     break
             try:
-                await asyncio.wait_for(state.wake.wait(), timeout=0.1)
+                now = time.monotonic()
+                deadlines = [started+VERIFY_SECONDS for started in state.sync_since.values()
+                             if started+VERIFY_SECONDS > now]
+                if state.quiet_deadline > now:
+                    deadlines.append(state.quiet_deadline)
+                timeout = max(.001, min(.1, min(deadlines)-now)) if deadlines else .1
+                await asyncio.wait_for(state.wake.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
+        if state.probe is not None:
+            await asyncio.gather(state.probe, return_exceptions=True)
 
     async def risk_loop(self):
         pending = None
@@ -720,15 +951,22 @@ class PostOnlyBot:
         while not self.closing:
             channel, market = 'stream', '-'
             self.ws_ready = False
+            self.ws_alive_at = 0
             self.generation += 1
             for state in self.states.values():
                 state.book_at = state.depth_at = 0
                 state.book_time = state.depth_time = 0
                 state.depth_barrier = state.depth_seq
+                state.quiet_deadline = 0
+                for anchor in state.anchors.values():
+                    anchor.update(price=None, candidate=None)
                 state.synced_generation = -1
                 state.wake.set()
             try:
                 async for message in self.risk_client.stream(self.by_market):
+                    self.ws_alive_at = time.monotonic()
+                    if message['type'] == 'pong':
+                        continue
                     if message["type"] == "ready":
                         self.ws_ready = True
                         self.need_reconcile = True
@@ -905,7 +1143,8 @@ if __name__ == "__main__":
             for i, market in enumerate(config.markets, 1):
                 print(f'{market.symbol}: orderSize={market.order_size} U/侧 | myLimit={market.position_limit} U')
             print(f'v2.0 | ±5bps | 深度WS/不限档 | 退后1 tick | Post-only | 下单/撤单=2/2 RPS | '
-                  f'MMR={config.mmr:.2%} | leverage={config.max_leverage}x | 无反向单')
+                  f'MMR={config.mmr:.2%} | leverage={config.max_leverage}x | '
+                  f'换墙优势={config.wall_switch_ratio}x | 确认={config.wall_confirm_ms}ms | 无反向单')
         else:
             sys.exit(asyncio.run(main(config)))
     except KeyboardInterrupt:
